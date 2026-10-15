@@ -358,6 +358,11 @@ jobs:
           bash test/archiveloop-camdisk-supervisor.test.sh
       - name: Run tests
         run: cargo test --workspace
+      - name: Run installer safety regressions
+        run: |
+          bash test/install-pi-safety.test.sh
+          bash test/sentryusb-pick-binary.test.sh
+          bash test/ble-setup-recovery.test.sh
 
   lint-web:
     name: Lint web
