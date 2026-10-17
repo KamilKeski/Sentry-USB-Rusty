@@ -765,6 +765,14 @@ const DIAGNOSTICS_SCRIPT: &str = r#"{
   else
     echo "SentryUSB networkd AP configuration is not installed"
   fi
+  echo "--- SentryUSB runtime DHCP override ---"
+  dhcp_override=/run/systemd/network/05-sentryusb-ap.network.d/90-sentryusb-dhcp.conf
+  if [ -f "$dhcp_override" ]; then
+    timeout 2 head -c 16384 "$dhcp_override" 2>&1 || echo "runtime DHCP override unavailable or timed out"
+    echo
+  else
+    echo "SentryUSB runtime DHCP override is not installed"
+  fi
   echo "--- networkd and hotspot services ---"
   # status returns nonzero for failed/inactive units; retain that evidence.
   timeout 3 systemctl --no-pager --full --lines=0 status \

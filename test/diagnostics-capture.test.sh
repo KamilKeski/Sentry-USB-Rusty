@@ -137,12 +137,17 @@ report=$(cat "$scratch/report")
 [[ $report == *'persistent-storage.service: failed (exit-code)'* ]]
 [[ $report == *'mock networkd journal: persistent storage unavailable'* ]]
 [[ $report == *'No IPv4 UDP port 67 listeners found'* ]]
+[[ $report == *'SentryUSB runtime DHCP override is not installed'* ]]
 [[ $report != *'SECRET_HOTSPOT_PASSWORD'* && $report != *'SECRET_HOME_WIFI_PASSWORD'* ]]
 [[ ! -e "$scratch/mutation" ]]
 network_probe_mode=listening
+mkdir -p "$scratch/run/systemd/network/05-sentryusb-ap.network.d"
+printf '[DHCPServer]\nPersistLeases=no\nBindToInterface=yes\n' \
+  > "$scratch/run/systemd/network/05-sentryusb-ap.network.d/90-sentryusb-dhcp.conf"
 capture
 report=$(cat "$scratch/report")
 [[ $report == *'0.0.0.0%ap0:67'* && $report != *'No IPv4 UDP port 67 listeners found'* ]]
+[[ $report == *'--- SentryUSB runtime DHCP override ---'* && $report == *'PersistLeases=no'* && $report == *'BindToInterface=yes'* ]]
 rm -rf "$gadget" "$scratch/mutable" "$scratch/proc/123"
 rm "$scratch/etc/systemd/network/05-sentryusb-ap.network"
 network_probe_mode=missing
