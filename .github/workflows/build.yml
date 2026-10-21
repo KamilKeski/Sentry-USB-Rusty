@@ -7,6 +7,11 @@ on:
   pull_request:
     branches: [main, main-dev]
   workflow_dispatch:
+    inputs:
+      release_version:
+        description: 'Version embedded in unpublished release artifacts (for example v3.24.8)'
+        required: false
+        type: string
 
 env:
   CARGO_TERM_COLOR: always
@@ -266,7 +271,7 @@ jobs:
 
       - name: Validate Cargo.lock
         # Validate the lockfile before the slower build.
-        run: cargo fetch --target ${{ matrix.target }}
+        run: cargo fetch --locked --target ${{ matrix.target }}
 
       - name: Build release binaries (sentryusb + telemetry sampler)
         # RUSTFLAGS tunes each CPU. mold supports native aarch64 here but not
@@ -279,12 +284,12 @@ jobs:
             aarch64-*) BUILD_WRAPPER="mold -run" ;;
             *)         BUILD_WRAPPER="" ;;
           esac
-          $BUILD_WRAPPER cargo build --release --target ${{ matrix.target }} -p sentryusb
-          $BUILD_WRAPPER cargo build --release --target ${{ matrix.target }} -p sentryusb-tesla-telemetry
+          $BUILD_WRAPPER cargo build --locked --release --target ${{ matrix.target }} -p sentryusb
+          $BUILD_WRAPPER cargo build --locked --release --target ${{ matrix.target }} -p sentryusb-tesla-telemetry
           # One-shot BLE keep-awake CLI used by run/awake_start.
-          $BUILD_WRAPPER cargo build --release --target ${{ matrix.target }} -p sentryusb-tesla-ble --bin sentryusb-ble-action
+          $BUILD_WRAPPER cargo build --locked --release --target ${{ matrix.target }} -p sentryusb-tesla-ble --bin sentryusb-ble-action
         env:
-          SENTRYUSB_RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+          SENTRYUSB_RELEASE_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || inputs.release_version || '' }}
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
 
@@ -359,7 +364,7 @@ jobs:
           bash test/archiveloop-gadget-cycle-min.test.sh
           bash test/archiveloop-camdisk-supervisor.test.sh
       - name: Run tests
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
       - name: Run installer safety regressions
         run: |
           bash test/install-pi-safety.test.sh
