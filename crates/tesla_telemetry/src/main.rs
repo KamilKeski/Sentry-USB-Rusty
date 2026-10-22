@@ -47,6 +47,17 @@ const OWNER: &str = "telemetry";
 /// sub-samplers run on their own intervals (see `Schedule`).
 const DRIVE_INTERVAL: Duration = Duration::from_secs(15);
 
+/// `state drive` cadence while the car is being driven (a fresh held gear
+/// of Drive, Reverse or Neutral), so gear, location and odometer keep up
+/// with a moving car. The car is awake, so polling costs no wake-up, and
+/// the radio lock is held across Active ticks, so a shorter cadence adds
+/// no lock churn with the other BLE processes.
+const DRIVE_INTERVAL_DRIVING: Duration = Duration::from_secs(5);
+
+/// How recent a driving gear must be to select the driving cadences. A
+/// held Drive from before a run of failed polls doesn't count.
+const DRIVING_GEAR_MAX_AGE: Duration = Duration::from_secs(30);
+
 /// How often to refresh climate (cabin/exterior temp, HVAC) in
 /// Active mode. 60s is fine — these are slow-changing.
 const CLIMATE_INTERVAL: Duration = Duration::from_secs(60);
@@ -64,6 +75,9 @@ const CHARGE_INITIAL_OFFSET: Duration = Duration::from_secs(30);
 /// — it reverts to `CHARGE_INTERVAL` the moment power drops or the charge
 /// ends.
 const CHARGE_FAST_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Charge refresh while driving: battery % moves steadily on the road.
+const CHARGE_INTERVAL_DRIVING: Duration = Duration::from_secs(30);
 
 /// Charger power (kW) above which we treat a charge as DC fast charging
 /// and switch to `CHARGE_FAST_INTERVAL`. Mirror of
@@ -168,6 +182,15 @@ const RADIO_CONTENDED_BACKOFF: Duration = Duration::from_secs(5);
 /// to be aggressive — settings changes are infrequent.
 const DISABLED_POLL: Duration = Duration::from_secs(60);
 
+/// True when the held gear is a fresh Drive, Reverse or Neutral reading.
+fn is_driving(shift: Option<&TimedReading<sample::ShiftState>>) -> bool {
+    use sample::ShiftState::{Drive, Neutral, Reverse};
+    matches!(
+        shift.and_then(|r| r.fresh(DRIVING_GEAR_MAX_AGE)),
+        Some(Drive | Reverse | Neutral)
+    )
+}
+
 /// Per-command "next due" timestamps for the Active-mode scheduler.
 /// Each tick walks the poll types in priority order and runs any due;
 /// `state drive` goes first (shiftState + locationName + odometer).
@@ -227,20 +250,28 @@ impl Schedule {
         }
     }
 
-    fn mark_drive(&mut self, now: Instant, success: bool) {
+    /// `driving` = the held gear says the car is moving (see `is_driving`).
+    fn mark_drive(&mut self, now: Instant, success: bool, driving: bool) {
         self.drive_failures = if success { 0 } else { self.drive_failures.saturating_add(1) };
-        self.next_drive = Self::next_after(now, success, self.drive_failures, DRIVE_INTERVAL);
+        let interval = if driving { DRIVE_INTERVAL_DRIVING } else { DRIVE_INTERVAL };
+        self.next_drive = Self::next_after(now, success, self.drive_failures, interval);
     }
     fn mark_climate(&mut self, now: Instant, success: bool) {
         self.climate_failures = if success { 0 } else { self.climate_failures.saturating_add(1) };
         self.next_climate = Self::next_after(now, success, self.climate_failures, CLIMATE_INTERVAL);
     }
     /// `fast` = the last charge poll saw active DC fast charging; use the
-    /// 15s cadence so the steep power taper is captured, else the 60s one.
-    /// The fast-retry-on-failure path is unchanged.
-    fn mark_charge(&mut self, now: Instant, success: bool, fast: bool) {
+    /// 15s cadence so the steep power taper is captured. `driving` uses the
+    /// 30s cadence; otherwise 60s. The fast-retry-on-failure path is unchanged.
+    fn mark_charge(&mut self, now: Instant, success: bool, fast: bool, driving: bool) {
         self.charge_failures = if success { 0 } else { self.charge_failures.saturating_add(1) };
-        let interval = if fast { CHARGE_FAST_INTERVAL } else { CHARGE_INTERVAL };
+        let interval = if fast {
+            CHARGE_FAST_INTERVAL
+        } else if driving {
+            CHARGE_INTERVAL_DRIVING
+        } else {
+            CHARGE_INTERVAL
+        };
         self.next_charge = Self::next_after(now, success, self.charge_failures, interval);
     }
     fn mark_tires(&mut self, now: Instant, success: bool) {
@@ -1134,7 +1165,9 @@ async fn tick(
             };
             // Fast-retry on failure (~3s), normal interval on
             // success. See Schedule::next_after for the pattern.
-            schedule.mark_drive(tick_now, success);
+            // From this poll's gear: a Park reading drops back to the
+            // normal cadence from the next schedule.
+            schedule.mark_drive(tick_now, success, is_driving(last_shift_state.as_ref()));
             any_call_ran = true;
         }
 
@@ -1274,7 +1307,12 @@ async fn tick(
                     false
                 }
             };
-            schedule.mark_charge(tick_now, success, fast_charging);
+            schedule.mark_charge(
+                tick_now,
+                success,
+                fast_charging,
+                is_driving(last_shift_state.as_ref()),
+            );
             any_call_ran = true;
         }
 
@@ -2012,6 +2050,42 @@ mod tests {
             value,
             at: Instant::now().checked_sub(age).expect("test age fits in Instant"),
         }
+    }
+
+    #[test]
+    fn driving_polls_gear_every_5s_and_battery_every_30s() {
+        let now = Instant::now();
+        let mut schedule = Schedule::new(now);
+
+        schedule.mark_drive(now, true, true);
+        assert_eq!(schedule.next_drive, now + DRIVE_INTERVAL_DRIVING);
+        // A Park reading goes back to the normal cadence on the next mark.
+        schedule.mark_drive(now, true, false);
+        assert_eq!(schedule.next_drive, now + DRIVE_INTERVAL);
+        // Failures keep the fast-retry path either way.
+        schedule.mark_drive(now, false, true);
+        assert_eq!(schedule.next_drive, now + FAST_RETRY_INTERVAL);
+
+        schedule.mark_charge(now, true, false, true);
+        assert_eq!(schedule.next_charge, now + CHARGE_INTERVAL_DRIVING);
+        schedule.mark_charge(now, true, false, false);
+        assert_eq!(schedule.next_charge, now + CHARGE_INTERVAL);
+        schedule.mark_charge(now, true, true, true);
+        assert_eq!(schedule.next_charge, now + CHARGE_FAST_INTERVAL);
+    }
+
+    #[test]
+    fn only_a_fresh_moving_gear_counts_as_driving() {
+        use sample::ShiftState::*;
+        let fresh = |gear| reading_aged(gear, Duration::from_secs(4));
+        for gear in [Drive, Reverse, Neutral] {
+            assert!(is_driving(Some(&fresh(gear))));
+        }
+        for gear in [Park, Unknown] {
+            assert!(!is_driving(Some(&fresh(gear))));
+        }
+        assert!(!is_driving(Some(&reading_aged(Drive, DRIVING_GEAR_MAX_AGE))));
+        assert!(!is_driving(None));
     }
 
     #[test]
