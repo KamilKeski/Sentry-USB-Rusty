@@ -33,6 +33,9 @@ struct EventMeta {
     timestamp: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     city: Option<String>,
+    /// Often written as an empty string; passed through as-is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    street: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -402,13 +405,26 @@ mod tests {
         fs::write(event.join("2025-02-22_17-58-00-front.mp4"), b"").unwrap();
         fs::write(
             event.join("event.json"),
-            r#"{"city":"San Francisco, CA","reason":"sentry_aware_object_detection"}"#,
+            r#"{"city":"San Francisco, CA","street":"123 Main St","reason":"sentry_aware_object_detection"}"#,
         )
         .unwrap();
+        // Tesla often writes an empty street; older events have none.
+        for (date, json) in [
+            ("2025-02-21_09-00-00", r#"{"city":"Edmonton","street":"","reason":"trick_or_treat"}"#),
+            ("2025-02-20_09-00-00", r#"{"city":"Edmonton","reason":"user_interaction_honk"}"#),
+        ] {
+            let older = root.path().join("SentryClips").join(date);
+            fs::create_dir_all(&older).unwrap();
+            fs::write(older.join(format!("{date}-front.mp4")), b"").unwrap();
+            fs::write(older.join("event.json"), json).unwrap();
+        }
 
         let value = list_clips_in(root.path(), "SentryClips", 20, None);
         let clips = value[0]["clips"].as_array().unwrap();
-        assert_eq!(clips.len(), 1);
+        assert_eq!(clips.len(), 3);
+        assert_eq!(clips[0]["event"]["street"].as_str().unwrap(), "123 Main St");
+        assert_eq!(clips[1]["event"]["street"].as_str().unwrap(), "");
+        assert!(clips[2]["event"].get("street").is_none());
         assert_eq!(clips[0]["date"].as_str().unwrap(), "2025-02-22_17-58-00");
         assert_eq!(
             clips[0]["path"].as_str().unwrap(),
