@@ -361,6 +361,7 @@ jobs:
           bash test/ap-profile.test.sh
           python3 test/networkd-ap.test.py
           python3 test/ble-auth.test.py
+          python3 test/avahi-service.test.py
           bash test/usb-startup.test.sh
           bash test/archiveloop-gadget-cycle-min.test.sh
           bash test/archiveloop-camdisk-supervisor.test.sh

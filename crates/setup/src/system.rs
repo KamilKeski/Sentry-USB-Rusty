@@ -123,22 +123,34 @@ fn avahi_ipv4_only_rewrite() -> Option<String> {
     changed.then_some(current)
 }
 
+/// The one mDNS advertisement, shared with the update migration and
+/// sentryusb-ble.py (which rewrites any installed file that differs).
+const AVAHI_SERVICE_TEMPLATE: &str = include_str!("../../../setup/pi/avahi-sentryusb.service");
+
+/// Device suffix as sentryusb-ble.py derives it: the last 4 characters of
+/// /etc/machine-id, uppercased. The script falls back to the Bluetooth
+/// address when machine-id is unreadable; setup uses 0000 and leaves the
+/// script to correct it when it starts.
+fn device_suffix(machine_id: Option<&str>) -> String {
+    match machine_id.map(str::trim) {
+        Some(id) if !id.is_empty() => {
+            let start = id.char_indices().rev().nth(3).map_or(0, |(i, _)| i);
+            id[start..].to_uppercase()
+        }
+        _ => "0000".to_string(),
+    }
+}
+
+fn avahi_service_xml(suffix: &str) -> String {
+    AVAHI_SERVICE_TEMPLATE.replace("@DEVICE_SUFFIX@", suffix)
+}
+
 /// Configures Avahi discovery and returns false when already healthy.
 pub async fn configure_avahi(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let hostname = env.get("SENTRYUSB_HOSTNAME", "sentryusb");
     let service_file = "/etc/avahi/services/sentryusb.service";
-    let desired = format!(
-        r#"<?xml version="1.0" standalone='no'?>
-<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
-<service-group>
-  <name replace-wildcards="yes">{hostname}</name>
-  <service>
-    <type>_http._tcp</type>
-    <port>80</port>
-  </service>
-</service-group>
-"#
-    );
+    let machine_id = std::fs::read_to_string("/etc/machine-id").ok();
+    let desired = avahi_service_xml(&device_suffix(machine_id.as_deref()));
 
     let needs_install = sentryusb_shell::run("which", &["avahi-daemon"]).await.is_err();
     let existing = std::fs::read_to_string(service_file).unwrap_or_default();
@@ -989,3 +1001,27 @@ print(int(calendar.timegm(t)))\
 [Install]
 WantedBy=sysinit.target
 "#;
+
+#[cfg(test)]
+mod avahi_service_tests {
+    use super::{avahi_service_xml, device_suffix};
+
+    #[test]
+    fn suffix_matches_the_ble_daemon() {
+        assert_eq!(device_suffix(Some("0123456789abcdef0123456789abec92\n")), "EC92");
+        assert_eq!(device_suffix(Some("ab")), "AB");
+        assert_eq!(device_suffix(Some("  \n")), "0000");
+        assert_eq!(device_suffix(None), "0000");
+    }
+
+    #[test]
+    fn advertises_sentryusb_with_suffix_and_http_fallback() {
+        let xml = avahi_service_xml("EC92");
+        assert!(xml.contains("<name replace-wildcards=\"yes\">%h</name>"));
+        assert!(xml.contains("<type>_sentryusb._tcp</type>"));
+        assert!(xml.contains("<txt-record>path=/api</txt-record>"));
+        assert!(xml.contains("<txt-record>suffix=EC92</txt-record>"));
+        assert!(xml.contains("<type>_http._tcp</type>"));
+        assert!(!xml.contains("@DEVICE_SUFFIX@"));
+    }
+}

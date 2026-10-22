@@ -1,21 +1,25 @@
 <?xml version="1.0" standalone='no'?>
 <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
 <!--
-  Avahi/mDNS service advertisement for SentryUSB.
-  Allows the iOS app to discover the Pi on the local network via Bonjour.
-  Installed to /etc/avahi/services/sentryusb.service during setup.
-
-  NOTE: sentryusb-ble.py rewrites this file on startup to add a
-  suffix=XXXX TXT record derived from /etc/machine-id. The iOS app
-  uses that suffix to display unique names like SentryUSB-EC92.
+  mDNS advertisement for Sentry USB, installed to
+  /etc/avahi/services/sentryusb.service. Setup, the update migration and
+  sentryusb-ble.py all render this same template, filling the suffix TXT
+  record with the last 4 characters of /etc/machine-id, uppercased (the
+  iOS app shows names like SentryUSB-EC92). sentryusb-ble.py rewrites any
+  installed file that differs, so keep its copy identical to this one.
+  The iOS app browses _sentryusb._tcp and falls back to _http._tcp.
 -->
 <service-group>
   <name replace-wildcards="yes">%h</name>
-
   <service>
     <type>_sentryusb._tcp</type>
     <port>80</port>
     <txt-record>version=1.0.0</txt-record>
     <txt-record>path=/api</txt-record>
+    <txt-record>suffix=@DEVICE_SUFFIX@</txt-record>
+  </service>
+  <service>
+    <type>_http._tcp</type>
+    <port>80</port>
   </service>
 </service-group>

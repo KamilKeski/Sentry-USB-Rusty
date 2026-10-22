@@ -596,7 +596,14 @@ function install_avahi_service () {
   fi
   mkdir -p /etc/avahi/services
   copy_script setup/pi/avahi-sentryusb.service /tmp
-  mv /tmp/avahi-sentryusb.service /etc/avahi/services/sentryusb.service
+  # Same rendering as the Rust setup and sentryusb-ble.py: the suffix TXT
+  # record is the last 4 characters of /etc/machine-id, uppercased.
+  local machine_id avahi_suffix
+  machine_id=$(tr -d '[:space:]' < /etc/machine-id 2>/dev/null || true)
+  avahi_suffix=$(printf '%s' "$machine_id" | tail -c 4 | tr '[:lower:]' '[:upper:]')
+  sed "s/@DEVICE_SUFFIX@/${avahi_suffix:-0000}/" /tmp/avahi-sentryusb.service \
+    > /etc/avahi/services/sentryusb.service
+  rm -f /tmp/avahi-sentryusb.service
   # Advertise IPv4 only: a AAAA answer for .local sends Windows/Chrome to the
   # Pi's rotating SLAAC address (slow, stale) and triggers Chrome Private
   # Network Access "CORS" blocks on the plain-http UI. Device IPv6 untouched.

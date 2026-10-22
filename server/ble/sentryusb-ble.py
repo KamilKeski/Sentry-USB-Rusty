@@ -566,14 +566,19 @@ def is_setup_finished():
 
 AVAHI_SERVICE_PATH = '/etc/avahi/services/sentryusb.service'
 
-def update_avahi_service_name(name):
-    """Rewrite the Avahi mDNS service file to include the device suffix as a
-    TXT record. The service name stays as %h (hostname) so .local resolution
-    keeps working. The iOS app reads the 'suffix' TXT record to build a
-    display name like 'SentryUSB-EC92'."""
-    suffix = get_device_suffix()
-    service_xml = f'''<?xml version="1.0" standalone='no'?>
+# Must stay identical to setup/pi/avahi-sentryusb.service, which setup and
+# the update migration render the same way (test/avahi-service.test.py).
+AVAHI_SERVICE_TEMPLATE = '''<?xml version="1.0" standalone='no'?>
 <!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  mDNS advertisement for Sentry USB, installed to
+  /etc/avahi/services/sentryusb.service. Setup, the update migration and
+  sentryusb-ble.py all render this same template, filling the suffix TXT
+  record with the last 4 characters of /etc/machine-id, uppercased (the
+  iOS app shows names like SentryUSB-EC92). sentryusb-ble.py rewrites any
+  installed file that differs, so keep its copy identical to this one.
+  The iOS app browses _sentryusb._tcp and falls back to _http._tcp.
+-->
 <service-group>
   <name replace-wildcards="yes">%h</name>
   <service>
@@ -581,20 +586,45 @@ def update_avahi_service_name(name):
     <port>80</port>
     <txt-record>version=1.0.0</txt-record>
     <txt-record>path=/api</txt-record>
-    <txt-record>suffix={suffix}</txt-record>
+    <txt-record>suffix=@DEVICE_SUFFIX@</txt-record>
+  </service>
+  <service>
+    <type>_http._tcp</type>
+    <port>80</port>
   </service>
 </service-group>
 '''
+
+
+def avahi_service_xml(suffix):
+    return AVAHI_SERVICE_TEMPLATE.replace('@DEVICE_SUFFIX@', suffix)
+
+
+def update_avahi_service_name(name):
+    """Make the Avahi mDNS service file match the shared advertisement,
+    with this Pi's suffix TXT record. The service name stays as %h
+    (hostname) so .local resolution keeps working. The iOS app reads the
+    'suffix' TXT record to build a display name like 'SentryUSB-EC92'.
+
+    Compares the whole file, not just the suffix, so a file another writer
+    left behind (an older setup, a hand edit) is repaired on startup."""
+    suffix = get_device_suffix()
+    service_xml = avahi_service_xml(suffix)
     try:
-        # Only rewrite if the suffix record is missing or different
-        if os.path.exists(AVAHI_SERVICE_PATH):
+        try:
             with open(AVAHI_SERVICE_PATH, 'r') as f:
-                current = f.read()
-            if f'suffix={suffix}' in current:
-                log.info(f'Avahi service already has suffix: {suffix}')
-                return
-        with open(AVAHI_SERVICE_PATH, 'w') as f:
+                if f.read() == service_xml:
+                    log.info(f'Avahi service already current (suffix={suffix})')
+                    return
+        except FileNotFoundError:
+            pass
+        # Root filesystem is read-only at runtime — remount rw before writing.
+        subprocess.run(['/root/bin/remountfs_rw'], capture_output=True, timeout=5)
+        os.makedirs(os.path.dirname(AVAHI_SERVICE_PATH), exist_ok=True)
+        tmp = AVAHI_SERVICE_PATH + '.tmp'
+        with open(tmp, 'w') as f:
             f.write(service_xml)
+        os.replace(tmp, AVAHI_SERVICE_PATH)
         # Restart avahi to pick up the change
         subprocess.run(['systemctl', 'restart', 'avahi-daemon'],
                        capture_output=True, timeout=10)
