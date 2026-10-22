@@ -22,6 +22,68 @@ async function setup() {
   } }
 }
 
+for (const scenario of [
+  { name: 'Owner by default', driver: false, installed: true, paired: false },
+  { name: 'experimental Driver', driver: true, installed: true, paired: false },
+  { name: 'Driver after asynchronous installation', driver: true, installed: false, paired: false },
+  { name: 'Driver when re-pairing', driver: true, installed: true, paired: true },
+]) {
+  test(`BLE pairing submits ${scenario.name} only after an explicit pairing action`, async (t) => {
+    const dom = await setup()
+    const { BlePairButton } = await import('./BlePairButton.tsx')
+    const { wsClient } = await import('../../../lib/ws.ts')
+    const handlers = new Map<string, (data: unknown) => void>()
+    t.mock.method(wsClient, 'subscribe', (type: string, handler: (data: unknown) => void) => {
+      handlers.set(type, handler)
+      return () => { handlers.delete(type) }
+    })
+    const writes: { url: string; body: unknown }[] = []
+    globalThis.fetch = async (input, init) => {
+      const url = String(input)
+      if (init?.method === 'POST') {
+        writes.push({ url, body: init.body ? JSON.parse(String(init.body)) : null })
+        return Response.json({ already_installed: false })
+      }
+      if (url === '/api/system/ble-enabled') return Response.json({ enabled: true })
+      if (url.startsWith('/api/system/ble-status')) return Response.json({
+        status: scenario.paired ? 'paired' : 'keys_generated',
+        vin: '5YJ3E1EA1KF000001', binaries_installed: scenario.installed,
+      })
+      if (url === '/api/system/ble-adapters') return Response.json({ current: 'hci0', default: 'hci0', available: [] })
+      if (url === '/api/system/clock-status') return Response.json({ synced: true, show_warning: false })
+      return Response.json({})
+    }
+    try {
+      await act(async () => dom.root.render(createElement(StrictMode, {}, createElement(BlePairButton))))
+      const toggle = dom.container.querySelector('input[role="switch"]')! as unknown as HTMLInputElement
+      assert.equal(toggle.checked, false)
+      assert.equal(dom.container.querySelector('#ble-driver-key-help'), null)
+      assert.equal(toggle.hasAttribute('aria-describedby'), false)
+      await act(async () => toggle.click())
+      assert.match(dom.container.querySelector('#ble-driver-key-help')!.textContent, /Some vehicle functions may be restricted/)
+      assert.equal(toggle.getAttribute('aria-describedby'), 'ble-driver-key-help')
+      await act(async () => toggle.click())
+      assert.equal(dom.container.querySelector('#ble-driver-key-help'), null)
+      if (scenario.driver) await act(async () => toggle.click())
+      assert.deepEqual(writes, [], 'changing the selection must not initiate pairing')
+      const label = scenario.paired ? 'Re-pair' : scenario.installed ? 'Pair BLE' : 'Install + Pair'
+      const pair = [...dom.container.querySelectorAll('button')].find(button => button.textContent.trim() === label)!
+      await act(async () => pair.click())
+      assert.equal(toggle.disabled, true, 'role is frozen during installation/pairing')
+      if (!scenario.installed) {
+        assert.deepEqual(writes.map(write => write.url), ['/api/system/ble-install'])
+        await act(async () => handlers.get('ble_install_status')!({ status: 'done' }))
+      }
+      assert.deepEqual(writes.filter(write => write.url === '/api/system/ble-pair'), [
+        { url: '/api/system/ble-pair', body: { driver_key: scenario.driver } },
+      ])
+    } finally {
+      await dom.cleanup()
+      t.mock.restoreAll()
+    }
+  })
+}
+
 test('speed test aborts StrictMode stale responses and the active stream on Stop; restarting owns a new request', async () => {
   const dom = await setup()
   const { SpeedTestModal } = await import('./SpeedTestModal.tsx')

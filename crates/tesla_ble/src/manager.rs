@@ -43,6 +43,7 @@ use tracing::{debug, info, warn};
 use crate::auth;
 use crate::crypto::{SessionKey, derive_session_key};
 use crate::gatt::Connection;
+use crate::pairing::PairingRole;
 use crate::keys::KeyPair;
 use crate::proto::signatures::{SessionInfo, signature_data};
 use crate::proto::universal_message::{
@@ -177,6 +178,7 @@ enum Command {
     /// the old tesla-control flow. Fire-and-forget: the car prompts for an
     /// NFC-card tap; enrolment is confirmed later via CheckPairing.
     AddKey {
+        role: PairingRole,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Tactical recovery: caller asks the background task to force-close
@@ -505,10 +507,10 @@ impl PersistentSession {
     /// failure (e.g. the car's BLE slots are full, or it's out of range).
     ///
     /// [`check_pairing`]: Self::check_pairing
-    pub async fn add_key_request(&self) -> Result<()> {
+    pub async fn add_key_request(&self, role: PairingRole) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         self.cmd_tx
-            .send(Command::AddKey { reply: tx })
+            .send(Command::AddKey { role, reply: tx })
             .await
             .context("PersistentSession background task has stopped")?;
         rx.await.context("session task dropped the reply channel")?
@@ -735,11 +737,11 @@ async fn run_session_task(
                 };
                 let _ = reply.send(status);
             }
-            Command::AddKey { reply } => {
+            Command::AddKey { role, reply } => {
                 // Errors here are connect/transport failures — route them
                 // through the transport handler so a dead link is dropped
                 // and reconnected on the next op, same as the queries.
-                let result = handle_add_key(&mut state).await;
+                let result = handle_add_key(&mut state, role).await;
                 handle_transport_error_if_any(&mut state, &result).await;
                 if result.is_ok() {
                     note_successful_query(&mut state, started.elapsed().as_millis());
@@ -1502,9 +1504,9 @@ async fn handle_body_controller(
 /// connection. Fire-and-forget — the car prompts for an NFC-card tap and
 /// enrolment is confirmed later by a `session-info` probe, so we only
 /// surface connect/write failures here.
-async fn handle_add_key(state: &mut SessionState) -> Result<()> {
+async fn handle_add_key(state: &mut SessionState, role: PairingRole) -> Result<()> {
     ensure_connected(state).await?;
-    let payload = crate::pairing::build_add_key_request(&state.keypair.pub_uncompressed);
+    let payload = crate::pairing::build_add_key_request(&state.keypair.pub_uncompressed, role);
     let conn = state
         .conn
         .as_mut()

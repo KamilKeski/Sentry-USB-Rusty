@@ -139,6 +139,9 @@ export function BlePairButton() {
   const [adapterReadError, setAdapterReadError] = useState<string | null>(null)
   const [clockStatus, setClockStatus] = useState<ClockStatusResp | null>(null)
   const [vinRevealed, setVinRevealed] = useState(false)
+  const [driverKey, setDriverKey] = useState(false)
+  // Freeze the choice at Pair, including when installation completes later.
+  const pendingDriverKey = useRef(false)
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -476,7 +479,11 @@ export function BlePairButton() {
     setBleState("initiating")
     setBleMsg("Install complete. Sending pairing request...")
     try {
-      const res = await fetch("/api/system/ble-pair", { method: "POST" })
+      const res = await fetch("/api/system/ble-pair", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ driver_key: pendingDriverKey.current }),
+      })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.error || "Failed to initiate BLE pairing")
@@ -498,6 +505,10 @@ export function BlePairButton() {
       setBleMsg("VIN must be exactly 17 alphanumeric characters.")
       return
     }
+
+    pendingDriverKey.current = driverKey
+    setBleState("initiating")
+    setBleMsg("Preparing pairing request...")
 
     // Persist a changed VIN before installing or pairing.
     if (vinUpper !== savedVin) {
@@ -716,6 +727,27 @@ export function BlePairButton() {
           )}
         </div>
       </label>
+
+      <div className="rounded-lg border border-white/10 bg-white/[0.02] p-3">
+        <label className="flex items-center justify-between gap-3 text-xs text-slate-200">
+          <span>Pair as Driver key <span className="text-amber-400">(experimental)</span></span>
+          <input
+            type="checkbox"
+            role="switch"
+            checked={driverKey}
+            onChange={(event) => setDriverKey(event.target.checked)}
+            disabled={isActive || bleState === "loading" || bleState === "disabled"}
+            aria-describedby={driverKey ? "ble-driver-key-help" : undefined}
+            className="toggle-switch shrink-0 disabled:opacity-50"
+          />
+        </label>
+        {driverKey && (
+          <p id="ble-driver-key-help" className="mt-2 text-xs leading-relaxed text-slate-400">
+            Some vehicle functions may be restricted. Already paired? Remove the Sentry USB
+            key from the car's Locks screen, then pair again as Driver.
+          </p>
+        )}
+      </div>
 
       <p
         className={cn(

@@ -146,8 +146,36 @@ pub async fn cancel_archive(
     }
 }
 
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BlePairRequest {
+    #[serde(default)]
+    driver_key: bool,
+}
+
+fn ble_pair_role(body: &str) -> Result<sentryusb_tesla_ble::pairing::PairingRole, serde_json::Error> {
+    // Older clients post an empty body. Preserve Owner unless explicitly opted in.
+    let request: BlePairRequest = if body.trim().is_empty() {
+        BlePairRequest::default()
+    } else {
+        serde_json::from_str(body)?
+    };
+    Ok(if request.driver_key {
+        sentryusb_tesla_ble::pairing::PairingRole::Driver
+    } else {
+        sentryusb_tesla_ble::pairing::PairingRole::Owner
+    })
+}
+
 /// POST /api/system/ble-pair
-pub async fn ble_pair(State(s): State<AppState>, _body: String) -> (StatusCode, Json<serde_json::Value>) {
+pub async fn ble_pair(State(s): State<AppState>, body: String) -> (StatusCode, Json<serde_json::Value>) {
+    let role = match ble_pair_role(&body) {
+        Ok(role) => role,
+        Err(_) => return crate::json_error(
+            StatusCode::BAD_REQUEST,
+            "Expected a JSON object with an optional driver_key boolean",
+        ),
+    };
     // BLE enablement is the security boundary for vehicle key operations.
     if !crate::ble::is_ble_enabled() {
         return crate::json_error(
@@ -176,7 +204,7 @@ pub async fn ble_pair(State(s): State<AppState>, _body: String) -> (StatusCode, 
         let result = sentryusb_shell::run_with_timeout(
             Duration::from_secs(120),
             "/root/bin/sentryusb-ble-action",
-            &["pair"],
+            &[role.pair_verb()],
         ).await;
 
         match result {
@@ -228,6 +256,27 @@ pub async fn ble_pair(State(s): State<AppState>, _body: String) -> (StatusCode, 
     });
 
     (StatusCode::OK, Json(serde_json::json!({"status": "pairing_started"})))
+}
+
+#[cfg(test)]
+mod pairing_role_tests {
+    use super::ble_pair_role;
+    use sentryusb_tesla_ble::pairing::PairingRole;
+
+    #[test]
+    fn owner_is_default_and_driver_requires_explicit_opt_in() {
+        for body in ["", "  ", "{}", r#"{"driver_key":false}"#] {
+            assert_eq!(ble_pair_role(body).unwrap(), PairingRole::Owner);
+        }
+        assert_eq!(ble_pair_role(r#"{"driver_key":true}"#).unwrap(), PairingRole::Driver);
+    }
+
+    #[test]
+    fn malformed_requests_do_not_silently_pair_as_owner() {
+        for body in ["null", "true", "{", r#"{"driver_key":"true"}"#, r#"{"role":"driver"}"#] {
+            assert!(ble_pair_role(body).is_err(), "accepted {body}");
+        }
+    }
 }
 
 /// Remounts the protected root filesystem before persistent writes.

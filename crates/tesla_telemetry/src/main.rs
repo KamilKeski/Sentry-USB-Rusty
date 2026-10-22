@@ -1703,21 +1703,24 @@ async fn handle_action_request(
         SessionInfo,
         DriveState,
         SentryState,
-        Pair,
+        Pair(sentryusb_tesla_ble::pairing::PairingRole),
         Action(sentryusb_tesla_ble::actions::ActionPayload),
     }
-    let dispatch = match verb.as_str() {
-        "session-info" => Dispatch::SessionInfo,
-        "drive-state" => Dispatch::DriveState,
-        "sentry-state" => Dispatch::SentryState,
-        "pair" => Dispatch::Pair,
-        _ => match action_socket::parse_verb(&verb) {
-            Ok(a) => Dispatch::Action(a),
-            Err(e) => {
-                let _ = req.reply.send(Err(e));
-                return;
-            }
-        },
+    let dispatch = if let Some(role) = sentryusb_tesla_ble::pairing::PairingRole::from_pair_verb(&verb) {
+        Dispatch::Pair(role)
+    } else {
+        match verb.as_str() {
+            "session-info" => Dispatch::SessionInfo,
+            "drive-state" => Dispatch::DriveState,
+            "sentry-state" => Dispatch::SentryState,
+            _ => match action_socket::parse_verb(&verb) {
+                Ok(a) => Dispatch::Action(a),
+                Err(e) => {
+                    let _ = req.reply.send(Err(e));
+                    return;
+                }
+            },
+        }
     };
 
     // Lazy-spawn or reuse the PersistentSession on the configured
@@ -1835,16 +1838,18 @@ async fn handle_action_request(
         // already holds — sidestepping the car's "maximum number of BLE
         // devices" limit that the old stop-daemon-then-tesla-control flow
         // tripped. Enrolment is confirmed afterwards via session-info.
-        Dispatch::Pair => {
-            let result = session.add_key_request().await;
+        Dispatch::Pair(role) => {
+            let result = session.add_key_request(role).await;
             let elapsed_ms = started.elapsed().as_millis();
             match &result {
                 Ok(()) => info!(
-                    "action_socket: verb=pair add-key delivered ({}ms) — awaiting NFC tap",
+                    "action_socket: verb={} add-key delivered ({}ms) — awaiting NFC tap",
+                    role.pair_verb(),
                     elapsed_ms
                 ),
                 Err(e) => warn!(
-                    "action_socket: verb=pair failed after {}ms: {:#}",
+                    "action_socket: verb={} failed after {}ms: {:#}",
+                    role.pair_verb(),
                     elapsed_ms, e
                 ),
             }

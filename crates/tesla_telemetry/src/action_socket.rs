@@ -13,7 +13,8 @@
 //!   `charge-port-close`, `keep-accessory-on`, `keep-accessory-off`,
 //!   `charge-start`, `charge-stop`, `set-charging-amps:<n>`,
 //!   `set-charge-limit:<n>`,
-//!   `session-info`, `drive-state`, `sentry-state`.
+//!   `session-info`, `drive-state`, `sentry-state`,
+//!   `pair` (Owner), `pair-driver` (experimental Driver).
 //!
 //! `session-info` returns pairing status; `drive-state` returns `P`, `R`, `N`,
 //! or `D`; `sentry-state` returns `Off` or `On`. Unknown state fails.

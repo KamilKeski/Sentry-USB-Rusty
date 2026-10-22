@@ -38,6 +38,8 @@ You can run either, both, or neither.
 
 The [Setup Wizard's Keep Awake step](Setup-Wizard-Guide#7-keep-awake) walks you through pairing on first install. To re-pair or repair the link later, open **Settings → Car & Network**, then use **BLE Pairing → Re-pair**. You'll need to be near the car so it accepts the pair request.
 
+**Pair as Driver key (experimental)** is available in the BLE Pairing card. It is off by default, so normal pairing still requests an Owner key. Driver may restrict certain functions; telemetry, keep-awake, charging, and accessory-power compatibility is not fully verified. The choice applies only to the next pairing request and does not show or change an existing key’s role. To change roles, first remove the Sentry USB key from the car’s Locks screen, then pair again with the desired option and confirm with your key card.
+
 The card shows the paired VIN, current connection state, and a **Show output** button if you need the raw pairing log.
 
 ## Bluetooth adapter

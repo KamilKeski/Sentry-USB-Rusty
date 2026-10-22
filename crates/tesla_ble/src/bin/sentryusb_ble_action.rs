@@ -41,7 +41,8 @@
 //!   session-info       - pairing probe (see below)
 //!   drive-state        - current gear query (see below)
 //!   sentry-state       - current Sentry Mode query (Off/On; missing state fails)
-//!   pair               - add-key-to-whitelist request (prompts for NFC tap)
+//!   pair               - pair as Owner (prompts for NFC tap)
+//!   pair-driver        - pair as Driver (experimental; may restrict functions)
 //!   keygen             - generate the BLE P-256 keypair (replaces tesla-keygen)
 //!
 //! `session-info` is not an action: it prints exactly one stdout token
@@ -73,6 +74,7 @@ use sentryusb_tesla_ble::{
     actions::{self, ActionPayload},
     keys::KeyPair,
     manager::{PairingStatus, PersistentSession},
+    pairing::PairingRole,
     responses::{shift_state_token, sentry_mode_token},
 };
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -99,7 +101,7 @@ async fn main() -> ExitCode {
         Some(v) => v,
         None => {
             eprintln!(
-                "usage: sentryusb-ble-action <wake|sentry-on|sentry-off|charge-port-open|charge-port-close|keep-accessory-on|keep-accessory-off|charge-start|charge-stop|set-charging-amps:N|set-charge-limit:N|session-info|drive-state|sentry-state|pair|keygen>"
+                "usage: sentryusb-ble-action <wake|sentry-on|sentry-off|charge-port-open|charge-port-close|keep-accessory-on|keep-accessory-off|charge-start|charge-stop|set-charging-amps:N|set-charge-limit:N|session-info|drive-state|sentry-state|pair|pair-driver|keygen>"
             );
             return ExitCode::from(1);
         }
@@ -119,8 +121,8 @@ async fn main() -> ExitCode {
     // its own IPC-first / direct-fallback path and exit-code semantics
     // (0 = request delivered, tap your card; 3 = BLE/slot failure), so
     // handle it before the action dispatch too.
-    if verb == "pair" {
-        return run_pair().await;
+    if let Some(role) = PairingRole::from_pair_verb(&verb) {
+        return run_pair(role).await;
     }
     // `keygen` generates the P-256 keypair natively (replaces
     // `tesla-keygen create`). No BLE — pure local key generation.
@@ -408,8 +410,8 @@ async fn run_session_info() -> ExitCode {
 /// disabled/crashed daemon.
 ///
 /// Exit codes: 0 request delivered, 2 config/key error, 3 BLE/slot error.
-async fn run_pair() -> ExitCode {
-    match try_via_ipc("pair").await {
+async fn run_pair(role: PairingRole) -> ExitCode {
+    match try_via_ipc(role.pair_verb()).await {
         Ok(()) => {
             println!("OK");
             info!("add-key-request delivered via daemon IPC — tap your card on the console");
@@ -447,7 +449,7 @@ async fn run_pair() -> ExitCode {
         }
     };
     let session = PersistentSession::start(keypair, vin, adapter);
-    let result = tokio::time::timeout(Duration::from_secs(60), session.add_key_request()).await;
+    let result = tokio::time::timeout(Duration::from_secs(60), session.add_key_request(role)).await;
     session.shutdown().await;
     match result {
         Ok(Ok(())) => {
