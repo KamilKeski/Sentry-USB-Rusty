@@ -678,9 +678,8 @@ function NetworkTile({ status }: { status: PiStatus }) {
     <StatusTile icon={haveWifi || haveEth ? <WifiIcon className="h-4 w-4" /> : <WifiOffIcon className="h-4 w-4" />} halo={haveWifi || haveEth ? "accent" : "amber"} title="Network">
       {adapters ? adapters.map(adapter => (
         <div key={adapter.device} className="py-1">
-          <Row icon={<WifiIcon className="h-3.5 w-3.5" />} label={`${adapter.device === "wlan0" ? "Internal Wi-Fi" : adapter.device === "wlan1" ? "USB Wi-Fi" : "Wi-Fi"} (${adapter.device})`} sub={adapter.connected ? <WifiBars bars={getWifiStrengthBars(adapter.strength)} /> : "Not connected"} />
+          <Row icon={<WifiIcon className="h-3.5 w-3.5" />} label={`${adapter.ssid || "Wi-Fi"} (${adapter.device})`} sub={adapter.connected ? <WifiBars bars={getWifiStrengthBars(adapter.strength)} /> : "Not connected"} />
           {adapter.connected && <>
-            <Row label={adapter.ssid} />
             <div className="flex flex-wrap gap-x-4 gap-y-1 py-1 text-xs tabular-nums">
               <span className="text-emerald-400">↓ {formatThroughput(adapter.rx_bps, adapter.rate_state)}</span>
               <span className="text-sky-400">↑ {formatThroughput(adapter.tx_bps, adapter.rate_state)}</span>

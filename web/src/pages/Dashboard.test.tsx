@@ -50,8 +50,8 @@ test('dashboard keeps its last data on failure, reads server ETA, and never load
     await act(async () => win.document.dispatchEvent(new win.Event('visibilitychange')))
     assert.doesNotMatch(container.textContent, /5V supply/, 'A missing sensor sample must not leave a stale voltage on screen')
     assert.match(container.querySelector('[aria-label="Archive and library"]')!.textContent, /Upload 50\.0 Mbps/, 'Sum both Wi-Fi adapters and Ethernet without double-counting the legacy Wi-Fi field')
-    assert.match(container.textContent, /Internal Wi-Fi \(wlan0\)/)
-    assert.match(container.textContent, /USB Wi-Fi \(wlan1\)/)
+    assert.match(container.textContent, /Internal network \(wlan0\)/)
+    assert.match(container.textContent, /USB network \(wlan1\)/)
     const connectionDetails = [...container.querySelectorAll('details')].find(details => details.querySelector('summary')?.textContent === 'Connection details')!
     assert.ok(connectionDetails)
     assert.match(connectionDetails.textContent, /Wi-Fi address \(wlan0\)192\.0\.2\.10/)

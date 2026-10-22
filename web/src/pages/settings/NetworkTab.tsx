@@ -47,8 +47,6 @@ export function NetworkTab({ status, onOpenWizard, openTravelMode, onTravelModeC
                   <Row label="Signal" value={adapter.signal_dbm != null ? `${adapter.signal_dbm} dBm` : adapter.strength || "—"} />
                   {adapter.band && <Row label="Band" value={adapter.band} />}
                   {adapter.channel != null && <Row label="Channel" value={adapter.channel} />}
-                  {adapter.link_rx_mbps != null && <Row label="RX link speed" value={`${adapter.link_rx_mbps} Mbit/s`} />}
-                  {adapter.link_tx_mbps != null && <Row label="TX link speed" value={`${adapter.link_tx_mbps} Mbit/s`} />}
                 </>}
               </div>
             ))}
