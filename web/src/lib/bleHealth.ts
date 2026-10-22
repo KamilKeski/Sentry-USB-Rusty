@@ -111,7 +111,7 @@ export function deriveVehicleStatusLabel(
   return "Idle"
 }
 
-/** Accept gear only while the daemon gate snapshot itself is fresh. */
+/** Accept gear only while the reading itself is fresh (the server reports its age). */
 export function freshVehicleShiftState(
   shiftState: string | null | undefined,
   shiftStateSecondsAgo: number | null | undefined,

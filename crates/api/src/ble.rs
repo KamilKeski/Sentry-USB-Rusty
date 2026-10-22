@@ -575,46 +575,60 @@ const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
 
 /// Gate values and their own timestamp; database age is independent. Preserve
 /// `unknown` to distinguish a failed read from no value.
-fn parse_gate_status(
-    body: &str,
-) -> (Option<String>, Option<String>, Option<String>, Option<i64>) {
-    let mut sentry = None;
-    let mut charging = None;
-    let mut shift = None;
-    let mut updated = None;
-    for line in body.lines() {
-        if let Some(v) = line.strip_prefix("sentry_mode=") {
-            sentry = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("charging_state=") {
-            charging = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("shift_state=") {
-            shift = Some(v.trim().to_string());
-        } else if let Some(v) = line.strip_prefix("updated=") {
-            updated = v.trim().parse::<i64>().ok();
-        }
-    }
-    (sentry, charging, shift, updated)
+/// The daemon's gate file: the gate inputs it last read, the age of the held
+/// gear reading, and when the file was written.
+#[derive(Debug, Default, PartialEq)]
+struct GateStatus {
+    sentry_mode: Option<String>,
+    charging_state: Option<String>,
+    shift_state: Option<String>,
+    shift_state_age_s: Option<i64>,
+    updated: Option<i64>,
 }
 
-fn read_gate_status() -> (Option<String>, Option<String>, Option<String>, Option<i64>) {
-    let Ok(body) = std::fs::read_to_string(GATE_STATUS_PATH) else {
-        return (None, None, None, None);
-    };
-    parse_gate_status(&body)
+fn parse_gate_status(body: &str) -> GateStatus {
+    let mut gate = GateStatus::default();
+    for line in body.lines() {
+        if let Some(v) = line.strip_prefix("sentry_mode=") {
+            gate.sentry_mode = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("charging_state=") {
+            gate.charging_state = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("shift_state=") {
+            gate.shift_state = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("shift_state_age_s=") {
+            gate.shift_state_age_s = v.trim().parse::<i64>().ok();
+        } else if let Some(v) = line.strip_prefix("updated=") {
+            gate.updated = v.trim().parse::<i64>().ok();
+        }
+    }
+    gate
+}
+
+fn read_gate_status() -> GateStatus {
+    std::fs::read_to_string(GATE_STATUS_PATH)
+        .map(|body| parse_gate_status(&body))
+        .unwrap_or_default()
 }
 
 const DASHBOARD_SHIFT_FRESH_SECS: i64 = 120;
 
-fn fresh_gate_shift_state(
-    shift_state: Option<String>,
-    updated_ts: Option<i64>,
-    now_ts: i64,
-) -> (Option<String>, Option<i64>) {
-    let age = updated_ts.and_then(|updated| now_ts.checked_sub(updated));
+/// The gear to report and how old the reading is. The daemon holds the last
+/// gear a drive poll reported and writes its age; the reading's age is the
+/// file's age plus that (a file without the age line is as old as the file).
+/// Only a reading at most DASHBOARD_SHIFT_FRESH_SECS old is reported, and
+/// `absent` (never read) is no reading at all.
+fn fresh_gate_shift_state(gate: &GateStatus, now_ts: i64) -> (Option<String>, Option<i64>) {
+    let Some(shift_state) = gate.shift_state.as_deref().filter(|s| *s != "absent") else {
+        return (None, None);
+    };
+    let age = gate
+        .updated
+        .and_then(|updated| now_ts.checked_sub(updated))
+        .and_then(|file_age| file_age.checked_add(gate.shift_state_age_s.unwrap_or(0)));
     let fresh = age
         .map(|seconds| (0..=DASHBOARD_SHIFT_FRESH_SECS).contains(&seconds))
         .unwrap_or(false);
-    (if fresh { shift_state } else { None }, age)
+    (fresh.then(|| shift_state.to_string()), age)
 }
 
 /// Latest-sample lookback. The timestamp bound keeps per-field reverse-index
@@ -801,9 +815,9 @@ pub async fn ble_latest_sample(
         .unwrap_or(0);
 
     // Gate state comes from the daemon file, not historical samples.
-    let (sentry_mode, charging_state, shift_state, gate_updated_ts) = read_gate_status();
-    let (shift_state, shift_state_seconds_ago) =
-        fresh_gate_shift_state(shift_state, gate_updated_ts, now);
+    let gate = read_gate_status();
+    let (shift_state, shift_state_seconds_ago) = fresh_gate_shift_state(&gate, now);
+    let GateStatus { sentry_mode, charging_state, .. } = gate;
 
     match result {
         Some((
@@ -1187,41 +1201,72 @@ mod tests {
     #[test]
     fn gate_status_parser_keeps_its_own_update_timestamp() {
         let parsed = parse_gate_status(
-            "sentry_mode=Off\ncharging_state=Complete\nshift_state=Park\nupdated=1700000000\n",
+            "sentry_mode=Off\ncharging_state=Complete\nshift_state=Park\n\
+             shift_state_age_s=40\nshift_state_stale=false\nupdated=1700000000\n",
         );
         assert_eq!(
             parsed,
-            (
-                Some("Off".to_string()),
-                Some("Complete".to_string()),
-                Some("Park".to_string()),
-                Some(1_700_000_000),
-            )
+            GateStatus {
+                sentry_mode: Some("Off".to_string()),
+                charging_state: Some("Complete".to_string()),
+                shift_state: Some("Park".to_string()),
+                shift_state_age_s: Some(40),
+                updated: Some(1_700_000_000),
+            }
         );
+    }
+
+    fn gate(shift: &str, shift_age: Option<i64>, updated: Option<i64>) -> GateStatus {
+        GateStatus {
+            shift_state: Some(shift.to_string()),
+            shift_state_age_s: shift_age,
+            updated,
+            ..GateStatus::default()
+        }
     }
 
     #[test]
     fn gate_shift_freshness_suppresses_untrusted_timestamps() {
+        // Files without the age line: the reading is as old as the file.
         assert_eq!(
-            fresh_gate_shift_state(Some("Park".to_string()), Some(980), 1_000),
+            fresh_gate_shift_state(&gate("Park", None, Some(980)), 1_000),
             (Some("Park".to_string()), Some(20)),
         );
         assert_eq!(
-            fresh_gate_shift_state(Some("Drive".to_string()), Some(879), 1_000),
+            fresh_gate_shift_state(&gate("Drive", None, Some(879)), 1_000),
             (None, Some(121)),
         );
+        assert_eq!(fresh_gate_shift_state(&gate("Unknown", None, None), 1_000), (None, None));
         assert_eq!(
-            fresh_gate_shift_state(Some("Unknown".to_string()), None, 1_000),
-            (None, None),
-        );
-        assert_eq!(
-            fresh_gate_shift_state(Some("Park".to_string()), Some(1_001), 1_000),
+            fresh_gate_shift_state(&gate("Park", None, Some(1_001)), 1_000),
             (None, Some(-1)),
         );
         assert_eq!(
-            fresh_gate_shift_state(Some("Drive".to_string()), Some(i64::MIN), i64::MAX),
+            fresh_gate_shift_state(&gate("Drive", None, Some(i64::MIN)), i64::MAX),
             (None, None),
         );
+        assert_eq!(
+            fresh_gate_shift_state(&gate("Drive", Some(i64::MAX), Some(990)), 1_000),
+            (None, None),
+        );
+    }
+
+    #[test]
+    fn held_gear_is_reported_by_its_reading_age_and_absent_never() {
+        // Written 5 s ago by a tick without a drive poll; the drive poll
+        // read Drive 12 s before that.
+        assert_eq!(
+            fresh_gate_shift_state(&gate("Drive", Some(12), Some(995)), 1_000),
+            (Some("Drive".to_string()), Some(17)),
+        );
+        // A fresh file holding an old reading is not a fresh gear.
+        assert_eq!(
+            fresh_gate_shift_state(&gate("Park", Some(300), Some(998)), 1_000),
+            (None, Some(302)),
+        );
+        // Nothing read since the daemon started.
+        assert_eq!(fresh_gate_shift_state(&gate("absent", None, Some(999)), 1_000), (None, None));
+        assert_eq!(fresh_gate_shift_state(&GateStatus::default(), 1_000), (None, None));
     }
 
     fn cfg(pairs: &[(&str, &str)]) -> sentryusb_config::SetupConfig {

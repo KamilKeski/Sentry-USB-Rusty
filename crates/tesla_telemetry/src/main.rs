@@ -343,6 +343,10 @@ async fn main() -> Result<()> {
     // Same gate for sentry mode (from `state closures`): any non-Off
     // value keeps the car awake. `None` → assume on.
     let mut last_sentry_mode: Option<TimedReading<sample::SentryMode>> = None;
+    // Last gear a drive poll actually reported. Only drive polls carry
+    // it, so the gate file reports this held reading (with its age) on
+    // the ticks in between and in Quiet mode, not a per-tick "absent".
+    let mut last_shift_state: Option<TimedReading<sample::ShiftState>> = None;
     // Throttle for the staying-Active gate log (~1/min).
     let mut last_gate_log: Option<Instant> = None;
     // Last known GPS from the drive poll (held across ticks; parked
@@ -452,6 +456,7 @@ async fn main() -> Result<()> {
                     &mut ble_session,
                     &mut last_charging_state,
                     &mut last_sentry_mode,
+                    &mut last_shift_state,
                     &mut last_gate_log,
                     &mut last_lat,
                     &mut last_lon,
@@ -590,6 +595,7 @@ async fn tick(
     ble_session: &mut Option<sample_ble::SessionHandle>,
     last_charging_state: &mut Option<TimedReading<sample::ChargingState>>,
     last_sentry_mode: &mut Option<TimedReading<sample::SentryMode>>,
+    last_shift_state: &mut Option<TimedReading<sample::ShiftState>>,
     last_gate_log: &mut Option<Instant>,
     last_lat: &mut Option<f64>,
     last_lon: &mut Option<f64>,
@@ -1032,11 +1038,11 @@ async fn tick(
         // Keep the gate snapshot live in Quiet too — this is where a
         // reading crosses GATE_READING_MAX_AGE, and the (stale) marker
         // is the diagnostic for "why did the gate stop honoring it".
-        // `shift` is None truthfully: no Active drive poll ran.
+        // No drive poll runs in Quiet; the held gear carries its age.
         write_gate_status_file(
             last_sentry_mode.as_ref(),
             last_charging_state.as_ref(),
-            None,
+            last_shift_state.as_ref(),
         );
         (QUIET_INTERVAL, Some(cfg))
     } else {
@@ -1105,6 +1111,9 @@ async fn tick(
                         *last_location_name = d.location_name.clone();
                     }
                     shift_state_observed = d.shift_state;
+                    if let Some(shift) = d.shift_state {
+                        *last_shift_state = Some(TimedReading::now(shift));
+                    }
                     // Hold last-known GPS across ticks (parked polls omit
                     // coords); feeds the keep-accessory geofence.
                     if d.lat.is_some() {
@@ -1501,7 +1510,7 @@ async fn tick(
         write_gate_status_file(
             last_sentry_mode.as_ref(),
             last_charging_state.as_ref(),
-            shift_state_observed,
+            last_shift_state.as_ref(),
         );
 
         // Sleep until the next sub-sampler is due (usually drive, 15s).
@@ -1611,18 +1620,31 @@ const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
 fn write_gate_status_file(
     sentry: Option<&TimedReading<sample::SentryMode>>,
     charging: Option<&TimedReading<sample::ChargingState>>,
-    shift: Option<sample::ShiftState>,
+    shift: Option<&TimedReading<sample::ShiftState>>,
 ) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = std::fs::write(GATE_STATUS_PATH, gate_status_body(sentry, charging, shift, now));
+}
+
+fn gate_status_body(
+    sentry: Option<&TimedReading<sample::SentryMode>>,
+    charging: Option<&TimedReading<sample::ChargingState>>,
+    shift: Option<&TimedReading<sample::ShiftState>>,
+    now: u64,
+) -> String {
     let sentry_s = sentry
         .map(|r| format!("{:?}", r.value))
         .unwrap_or_else(|| "unknown".into());
     let charging_s = charging
         .map(|r| format!("{:?}", r.value))
         .unwrap_or_else(|| "unknown".into());
-    // `absent` = drive poll didn't report a shift_state (omitted from
-    // the response, or no drive poll ran this tick — Quiet mode).
+    // The last gear a drive poll reported, held between drive polls;
+    // `absent` = no drive poll has reported one since the daemon started.
     let shift_s = shift
-        .map(|s| format!("{s:?}"))
+        .map(|r| format!("{:?}", r.value))
         .unwrap_or_else(|| "absent".into());
     // Reading age as extra keys (parsers strip known prefixes only, so
     // these are additive). `_stale=true` = past GATE_READING_MAX_AGE —
@@ -1643,14 +1665,10 @@ fn write_gate_status_file(
     };
     let sentry_age = age_line("sentry_mode", sentry.map(|r| r.at));
     let charging_age = age_line("charging_state", charging.map(|r| r.at));
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let body = format!(
-        "sentry_mode={sentry_s}\n{sentry_age}charging_state={charging_s}\n{charging_age}shift_state={shift_s}\nupdated={now}\n"
-    );
-    let _ = std::fs::write(GATE_STATUS_PATH, body);
+    let shift_age = age_line("shift_state", shift.map(|r| r.at));
+    format!(
+        "sentry_mode={sentry_s}\n{sentry_age}charging_state={charging_s}\n{charging_age}shift_state={shift_s}\n{shift_age}updated={now}\n"
+    )
 }
 
 /// No-op, kept for call-site stability.
@@ -1994,6 +2012,26 @@ mod tests {
             value,
             at: Instant::now().checked_sub(age).expect("test age fits in Instant"),
         }
+    }
+
+    #[test]
+    fn gate_file_holds_the_last_gear_with_its_age() {
+        // A tick without a drive poll still reports the held reading.
+        let held = reading_aged(sample::ShiftState::Drive, Duration::from_secs(20));
+        let body = gate_status_body(None, None, Some(&held), 1_700_000_000);
+        assert_eq!(
+            body,
+            "sentry_mode=unknown\ncharging_state=unknown\nshift_state=Drive\n\
+             shift_state_age_s=20\nupdated=1700000000\n"
+        );
+
+        let old = reading_aged(sample::ShiftState::Park, GATE_READING_MAX_AGE);
+        let body = gate_status_body(None, None, Some(&old), 1_700_000_000);
+        assert!(body.contains("shift_state=Park\nshift_state_age_s=600\nshift_state_stale=true\n"), "{body}");
+
+        // Only before any drive poll has reported a gear.
+        let body = gate_status_body(None, None, None, 1_700_000_000);
+        assert!(body.contains("shift_state=absent\nupdated=1700000000\n"), "{body}");
     }
 
     #[test]

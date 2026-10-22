@@ -96,7 +96,7 @@ pub(crate) async fn recheck(state: &AppState, c: &Cycle) -> Result<()> {
     let (config, _) = sentryusb_config::parse_file(sentryusb_config::find_config_path())?;
     ensure!(!config.get("TRAVEL_MODE_ENABLED").is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "true"|"yes"|"1"|"on")), "Travel Mode active");
     if Path::new("/root/.ble/paired").try_exists()? && let Ok(gate) = std::fs::read_to_string("/mutable/sentryusb-ble-gate.txt") {
-        ensure!(!gate.lines().any(|l| matches!(l.trim(), "shift_state=Drive"|"shift_state=Reverse"|"shift_state=Neutral"|"shift_state=D"|"shift_state=R"|"shift_state=N")), "Vehicle is not parked");
+        ensure!(!gate_says_driving(&gate), "Vehicle is not parked");
     }
     let cloud = state.cloud.uploader.status().await;
     ensure!(cloud.credentials_load_error.is_none(), "Cloud credentials could not be checked");
@@ -113,6 +113,17 @@ pub(crate) async fn recheck(state: &AppState, c: &Cycle) -> Result<()> {
         .await.context("Archive is no longer reachable")?;
     ensure!(valid_cycle(c), "Archive cancelled during reachability check");
     Ok(())
+}
+
+/// The gate file reports a driving gear. The daemon holds the last gear a
+/// drive poll read, so one it has marked stale (no drive poll for 10 min)
+/// is no evidence the car is moving.
+fn gate_says_driving(gate: &str) -> bool {
+    let line = |l: &str| gate.lines().any(|g| g.trim() == l);
+    ["Drive", "Reverse", "Neutral", "D", "R", "N"]
+        .iter()
+        .any(|gear| line(&format!("shift_state={gear}")))
+        && !line("shift_state_stale=true")
 }
 
 const ARCHIVE_REACHABILITY_PROBE: &str = "source /root/bin/envsetup.sh && if [ -z \"${ARCHIVE_SERVER:-}\" ]; then if [ -n \"${RSYNC_SERVER:-}\" ]; then ARCHIVE_SERVER=$RSYNC_SERVER; elif [ -n \"${RCLONE_DRIVE:-}\" ]; then ARCHIVE_SERVER=8.8.8.8; fi; fi; test -n \"${ARCHIVE_SERVER:-}\" && /root/bin/archive-is-reachable.sh \"$ARCHIVE_SERVER\"";
@@ -371,6 +382,18 @@ fn stable_target_is_newer(installed: &str, candidate: &str, draft: bool, prerele
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_current_driving_gear_blocks_the_update() {
+        use super::gate_says_driving;
+        assert!(gate_says_driving("shift_state=Drive\nshift_state_age_s=30\nupdated=1\n"));
+        assert!(gate_says_driving("shift_state=R\nupdated=1\n"));
+        assert!(!gate_says_driving("shift_state=Park\nshift_state_age_s=30\nupdated=1\n"));
+        assert!(!gate_says_driving("shift_state=absent\nupdated=1\n"));
+        assert!(!gate_says_driving(
+            "shift_state=Drive\nshift_state_age_s=900\nshift_state_stale=true\nupdated=1\n"
+        ));
+    }
+
     use super::*;
     #[test]
     fn pending_install_notice_expires_when_attempt_finishes_or_is_superseded() {
