@@ -13,6 +13,7 @@ pub mod extract;
 pub mod grouper;
 pub mod home;
 pub mod json_compat;
+pub mod mp4_samples;
 pub mod mutable_intent;
 pub mod rate_intent;
 pub mod rate_confirmation;

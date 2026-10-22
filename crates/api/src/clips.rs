@@ -199,13 +199,15 @@ fn clip_telemetry_blocking(
     }
 
     // Deduplication would destroy the frame-to-time overlay mapping.
+    let scan = match sentryusb_drives::extract::scan_sei_frames(cleaned_str.as_ref()) {
+        Ok(scan) => scan,
+        Err(e) => return crate::json_error(StatusCode::NOT_FOUND, &format!("could not read file: {}", e)),
+    };
     let (points, gear_states, ap_states, speeds, accel_positions, flag_bytes, accel_x, accel_y) =
-        match sentryusb_drives::extract::extract_gps_from_file_raw(cleaned_str.as_ref()) {
-            Ok(raw) => raw,
-            Err(e) => return crate::json_error(StatusCode::NOT_FOUND, &format!("could not read file: {}", e)),
-        };
+        &scan.arrays;
 
     let video_duration = mp4_duration_sec(cleaned_str.as_ref()).unwrap_or(0.0);
+    let sample_times = sentryusb_drives::mp4_samples::video_sample_times(cleaned_str.as_ref()).ok();
     let num_points = points.len();
     let mut frames = Vec::with_capacity(num_points);
     let mut has_gps = false;
@@ -221,17 +223,14 @@ fn clip_telemetry_blocking(
         if ap != sentryusb_drives::extract::AUTOPILOT_OFF {
             has_autopilot = true;
         }
-        let t = if num_points > 1 && video_duration > 0.0 {
-            video_duration * (i as f64) / ((num_points - 1) as f64)
-        } else {
-            0.0
-        };
+        let t = sample_time(&scan, sample_times.as_ref(), i, video_duration);
         // Bitfield: 1 left blinker, 2 right blinker, 4 brake, 8 accelerator.
         let flags = *flag_bytes.get(i).unwrap_or(&0);
         // IMU lateral/longitudinal acceleration; absent SEI fields yield zero.
         let gx = *accel_x.get(i).unwrap_or(&0.0);
         let gy = *accel_y.get(i).unwrap_or(&0.0);
-        frames.push(serde_json::json!({
+        let steering = *scan.steering_deg.get(i).unwrap_or(&0.0);
+        frames.push((t, serde_json::json!({
             "t": t,
             "lat": pt[0],
             "lng": pt[1],
@@ -242,8 +241,12 @@ fn clip_telemetry_blocking(
             "flags": flags,
             "accel_mps2_x": gx,
             "accel_mps2_y": gy,
-        }));
+            "steering_angle_deg": steering,
+        })));
     }
+    // Decode order differs from presentation order when a clip has B-frames.
+    frames.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let frames: Vec<serde_json::Value> = frames.into_iter().map(|(_, frame)| frame).collect();
     let duration_sec = if video_duration > 0.0 { video_duration } else { 0.0 };
 
     (StatusCode::OK, Json(serde_json::json!({
@@ -252,6 +255,37 @@ fn clip_telemetry_blocking(
         "has_gps": has_gps,
         "has_autopilot": has_autopilot,
     })))
+}
+
+/// Seconds from the start of the video at which SEI sample `i` is shown.
+///
+/// Tesla writes telemetry SEI only into frames it has telemetry for (parked
+/// footage carries none), so a sample's time is its own frame's time, never
+/// its position among the samples. The frame's presentation time comes
+/// from the MP4 sample tables; if those can't be read, from the frame's
+/// index at the file's average frame rate. Only a file with no countable
+/// frames falls back to spreading the samples evenly.
+fn sample_time(
+    scan: &sentryusb_drives::extract::SeiScan,
+    sample_times: Option<&sentryusb_drives::mp4_samples::VideoSampleTimes>,
+    i: usize,
+    video_duration: f64,
+) -> f64 {
+    if let Some(t) = sample_times.zip(scan.sei_offsets.get(i)).and_then(|(times, &offset)| {
+        times.time_at_offset(offset)
+    }) {
+        return t;
+    }
+    if let (Some(&frame), true) = (scan.frame_indexes.get(i), scan.frame_count > 0 && video_duration > 0.0) {
+        let frame = frame.min(scan.frame_count - 1);
+        return video_duration * frame as f64 / scan.frame_count as f64;
+    }
+    let n = scan.arrays.0.len();
+    if n > 1 && video_duration > 0.0 {
+        video_duration * (i as f64) / ((n - 1) as f64)
+    } else {
+        0.0
+    }
 }
 
 fn mp4_duration_sec(path: &str) -> Option<f64> {
@@ -449,5 +483,35 @@ mod tests {
             .map(|v| v.as_str().unwrap())
             .collect();
         assert_eq!(files, vec!["2025-02-22_17-58-00-front.mp4"]);
+    }
+}
+
+#[cfg(test)]
+mod sample_time_tests {
+    use super::sample_time;
+    use sentryusb_drives::extract::SeiScan;
+
+    fn scan(frame_indexes: Vec<u32>, frame_count: u32) -> SeiScan {
+        let mut scan = SeiScan { frame_indexes, frame_count, ..SeiScan::default() };
+        scan.arrays.0 = vec![[37.5, -122.25]; scan.frame_indexes.len()];
+        scan
+    }
+
+    #[test]
+    fn without_sample_tables_samples_sit_at_their_frames() {
+        // 60 s clip, 1800 frames; SEI only on the first 600 (driving), the
+        // rest parked. The last driving sample is at 20 s, not at 60 s.
+        let scan = scan((0..600).collect(), 1800);
+        assert_eq!(sample_time(&scan, None, 0, 60.0), 0.0);
+        assert!((sample_time(&scan, None, 599, 60.0) - 599.0 / 30.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn without_frames_it_spreads_as_before() {
+        let scan = scan(Vec::new(), 0);
+        let mut spread = scan;
+        spread.arrays.0 = vec![[37.5, -122.25]; 3];
+        assert_eq!(sample_time(&spread, None, 2, 60.0), 60.0);
+        assert_eq!(sample_time(&spread, None, 1, 0.0), 0.0);
     }
 }

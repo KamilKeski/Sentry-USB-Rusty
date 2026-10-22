@@ -43,7 +43,7 @@ pub fn extract_gps_from_file(path: &str) -> Result<ExtractedGps> {
     }
 
     let (points, gears, ap_states, speeds, accel_positions, flags, accel_x, accel_y) =
-        extract_from_mdat(&mut f, mdat_offset, mdat_size)?;
+        extract_from_mdat(&mut f, mdat_offset, mdat_size)?.arrays;
     Ok(assemble_extracted(
         points,
         gears,
@@ -137,11 +137,19 @@ fn assemble_extracted(
 /// It was previously dropped here, which is why the clip telemetry endpoint
 /// could not report turn signals or braking despite both being decoded.
 pub fn extract_gps_from_file_raw(path: &str) -> Result<RawFrameArrays> {
+    Ok(scan_sei_frames(path)?.arrays)
+}
+
+/// The full SEI scan of a clip: the raw per-frame arrays plus where each
+/// SEI sits in the file and in the video, and the steering angle. Used by
+/// the clip-telemetry overlay, which must place each sample at its own
+/// frame's time. Drive processing uses only `arrays`.
+pub fn scan_sei_frames(path: &str) -> Result<SeiScan> {
     let mut f = File::open(path)
         .with_context(|| format!("failed to open MP4 file: {}", path))?;
     let (mdat_offset, mdat_size) = find_mdat_box(&mut f)?;
     if mdat_size == 0 {
-        return Ok(Default::default());
+        return Ok(SeiScan::default());
     }
     extract_from_mdat(&mut f, mdat_offset, mdat_size)
 }
@@ -208,7 +216,7 @@ fn find_mdat_box(f: &mut File) -> Result<(u64, u64)> {
 /// Raw per-frame arrays out of the SEI scan, 1:1 with SEI frames:
 /// (points, gears, autopilot states, speeds, accel positions, flag bytes,
 /// IMU lateral accel m/s², IMU longitudinal accel m/s²).
-type RawFrameArrays = (
+pub type RawFrameArrays = (
     Vec<GpsPoint>,
     Vec<u8>,
     Vec<u8>,
@@ -219,7 +227,23 @@ type RawFrameArrays = (
     Vec<f32>,
 );
 
-fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArrays> {
+/// One pass over the mdat. `arrays` is what drive processing consumes; the
+/// rest is 1:1 with it and serves the clip-telemetry overlay.
+#[derive(Debug, Default)]
+pub struct SeiScan {
+    pub arrays: RawFrameArrays,
+    /// File offset of each sample's SEI NAL (its 4-byte length prefix).
+    pub sei_offsets: Vec<u64>,
+    /// Index of the video frame each SEI belongs to: the frame whose first
+    /// slice follows it. Tesla writes the SEI ahead of its frame's slices.
+    pub frame_indexes: Vec<u32>,
+    /// Steering wheel angle, degrees (SEI field 6).
+    pub steering_deg: Vec<f32>,
+    /// Video frames in the mdat (slices starting at macroblock 0).
+    pub frame_count: u32,
+}
+
+fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<SeiScan> {
     use std::io::BufReader;
     const BUF_SIZE: u64 = 64 * 1024;
 
@@ -231,6 +255,10 @@ fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArr
     let mut flags = Vec::new();
     let mut accel_x = Vec::new();
     let mut accel_y = Vec::new();
+    let mut sei_offsets = Vec::new();
+    let mut frame_indexes = Vec::new();
+    let mut steering_deg = Vec::new();
+    let mut frame_count: u32 = 0;
 
     let end = offset + size;
     let mut cursor = offset;
@@ -245,6 +273,7 @@ fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArr
         if reader.read_exact(&mut size_buf).is_err() {
             break;
         }
+        let nal_offset = cursor;
         cursor += 4;
 
         let nal_size = u32::from_be_bytes(size_buf) as u64;
@@ -270,6 +299,9 @@ fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArr
                         (frame.lat * 1e6).round() / 1e6,
                         (frame.lon * 1e6).round() / 1e6,
                     ]);
+                    sei_offsets.push(nal_offset);
+                    frame_indexes.push(frame_count);
+                    steering_deg.push(frame.steering_deg);
                     gears.push(frame.gear);
                     ap_states.push(frame.ap_state);
                     speeds.push(frame.speed);
@@ -286,6 +318,20 @@ fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArr
             } else {
                 break;
             }
+        } else if nal_type == 1 || nal_type == 5 {
+            // Coded slice. A frame may be split into several slices; its
+            // first one starts at macroblock 0, whose ue(v) first_mb_in_slice
+            // is a single 1 bit, so the next byte's top bit marks a new frame.
+            let mut header = [0u8; 1];
+            if reader.read_exact(&mut header).is_err() {
+                break;
+            }
+            if header[0] & 0x80 != 0 {
+                frame_count += 1;
+            }
+            if reader.seek_relative((nal_size - 2) as i64).is_err() {
+                break;
+            }
         } else {
             // Skip the rest of this NAL (the type byte was already read).
             if reader.seek_relative((nal_size - 1) as i64).is_err() {
@@ -296,7 +342,13 @@ fn extract_from_mdat(f: &mut File, offset: u64, size: u64) -> Result<RawFrameArr
         cursor += nal_size;
     }
 
-    Ok((points, gears, ap_states, speeds, accel_positions, flags, accel_x, accel_y))
+    Ok(SeiScan {
+        arrays: (points, gears, ap_states, speeds, accel_positions, flags, accel_x, accel_y),
+        sei_offsets,
+        frame_indexes,
+        steering_deg,
+        frame_count,
+    })
 }
 
 /// One decoded SEI frame's worth of Tesla metadata.
@@ -316,6 +368,8 @@ struct SeiFrame {
     /// renders. proto3 omits zeros, so absent decodes as 0.0.
     accel_x: f32,
     accel_y: f32,
+    /// Steering wheel angle, degrees (proto field 6).
+    steering_deg: f32,
 }
 
 /// Finds the Tesla magic bytes (0x42...0x69) in a SEI NAL and decodes GPS + metadata.
@@ -370,6 +424,7 @@ fn strip_emulation_bytes(data: &[u8]) -> Vec<u8> {
 /// - brake_applied (field 9, varint) — pedal-only
 /// - linear_acceleration_mps2_x / _y (fields 14/15, double) — IMU
 ///   lateral / longitudinal acceleration (Sentry-Six dashcam.proto)
+/// - steering_wheel_angle (field 6, float/fixed32) — degrees
 ///
 /// proto3 omits false/zero fields from the wire, so absent simply
 /// decodes as off. Hand-parses protobuf wire format to avoid external
@@ -386,6 +441,7 @@ fn decode_sei_gps(data: &[u8]) -> Option<SeiFrame> {
     let mut brake = false;
     let mut accel_x: f32 = 0.0;
     let mut accel_y: f32 = 0.0;
+    let mut steering_deg: f32 = 0.0;
 
     let mut i = 0;
     while i < data.len() {
@@ -458,6 +514,8 @@ fn decode_sei_gps(data: &[u8]) -> Option<SeiFrame> {
                     speed = val;
                 } else if field_num == 5 {
                     accel_pos = val;
+                } else if field_num == 6 {
+                    steering_deg = val;
                 }
                 i += 4;
             }
@@ -490,6 +548,7 @@ fn decode_sei_gps(data: &[u8]) -> Option<SeiFrame> {
             brake,
             accel_x: clean(accel_x),
             accel_y: clean(accel_y),
+            steering_deg: clean(steering_deg),
         })
     } else {
         None
@@ -963,6 +1022,76 @@ mod tests {
         // and silently passed a naive length check.
         assert_eq!(out.autopilot_states.len(), moving);
         assert_ne!(ap_total as usize, out.autopilot_states.len());
+    }
+
+    /// A Tesla SEI NAL carrying gear, speed, steering and a GPS fix.
+    fn tesla_sei_nal(gear: u8, speed: f32, steering: f32) -> Vec<u8> {
+        let mut proto = vec![0x10, gear];
+        proto.push(0x25); // field 4, fixed32
+        proto.extend_from_slice(&speed.to_le_bytes());
+        proto.push(0x35); // field 6, fixed32
+        proto.extend_from_slice(&steering.to_le_bytes());
+        proto.push(0x59); // field 11, double
+        proto.extend_from_slice(&37.5f64.to_le_bytes());
+        proto.push(0x61); // field 12, double
+        proto.extend_from_slice(&(-122.25f64).to_le_bytes());
+        let mut nal = vec![0x06, 0x05, 0x00, 0x42, 0x42, 0x42, 0x69];
+        nal.extend_from_slice(&proto);
+        nal.push(0x80);
+        nal
+    }
+
+    fn length_prefixed(nal: &[u8]) -> Vec<u8> {
+        let mut out = (nal.len() as u32).to_be_bytes().to_vec();
+        out.extend_from_slice(nal);
+        out
+    }
+
+    #[test]
+    fn sei_samples_carry_their_own_frame_times() {
+        // Six frames at 30 fps. Frames 0-2 are driving and carry SEI; 3-5
+        // are parked and carry none. Frame 1 is split into two slices.
+        let idr = [0x65, 0x88, 0x84, 0x00];
+        let first_slice = [0x41, 0x9a, 0x02, 0x00];
+        let second_slice = [0x41, 0x40, 0x11, 0x00];
+        let mut mdat = Vec::new();
+        let mut sizes = Vec::new();
+        for frame in 0..6u32 {
+            let start = mdat.len();
+            if frame < 3 {
+                mdat.extend(length_prefixed(&tesla_sei_nal(GEAR_DRIVE, 2.0 + frame as f32, -15.5)));
+            }
+            mdat.extend(length_prefixed(if frame == 0 { &idr } else { &first_slice }));
+            if frame == 1 {
+                mdat.extend(length_prefixed(&second_slice));
+            }
+            sizes.push((mdat.len() - start) as u32);
+        }
+        let mut file = ((8 + mdat.len()) as u32).to_be_bytes().to_vec();
+        file.extend_from_slice(b"mdat");
+        file.extend_from_slice(&mdat);
+        file.extend(crate::mp4_samples::tests::video_moov(8, &sizes, 30_000, 1_000, None, None));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("clip-front.mp4");
+        std::fs::write(&path, &file).unwrap();
+        let path = path.to_str().unwrap();
+
+        let scan = scan_sei_frames(path).unwrap();
+        assert_eq!(scan.frame_count, 6);
+        assert_eq!(scan.frame_indexes, vec![0, 1, 2]);
+        assert_eq!(scan.steering_deg, vec![-15.5; 3]);
+        assert_eq!(scan.arrays.3, vec![2.0, 3.0, 4.0]);
+
+        let times = crate::mp4_samples::video_sample_times(path).unwrap();
+        let at: Vec<f64> = scan
+            .sei_offsets
+            .iter()
+            .map(|&offset| times.time_at_offset(offset).unwrap())
+            .collect();
+        assert_eq!(at, vec![0.0, 1.0 / 30.0, 2.0 / 30.0]);
+
+        // Drive processing still sees exactly the three samples.
+        assert_eq!(extract_gps_from_file_raw(path).unwrap().0.len(), 3);
     }
 
     #[test]
