@@ -24,6 +24,8 @@ import subprocess
 import os
 import sys
 import signal
+import hashlib
+import struct
 import logging
 import time
 import hmac
@@ -748,7 +750,11 @@ PROXY_RETRY_BOOT_WINDOW_S = 120
 
 def proxy_api_request(method, path, body=None, retries=None, retry_delay=1.5):
     """Forward an API request to the local Go server.
-    Retries on connection errors only during the boot window (see above)."""
+    Retries on connection errors only during the boot window (see above).
+
+    Returns {status, body, raw}: `body` is parsed JSON (or text) for the JSON
+    reply path and logging; `raw` is the server's response bytes verbatim
+    for binary frames, which must not re-serialize them."""
     import time
     if retries is None:
         in_boot_window = (
@@ -768,14 +774,15 @@ def proxy_api_request(method, path, body=None, retries=None, retry_delay=1.5):
                 parsed = json.loads(response_body)
             except (json.JSONDecodeError, ValueError):
                 parsed = response_body.decode('utf-8', errors='replace')
-            return {'status': resp.getcode(), 'body': parsed}
+            return {'status': resp.getcode(), 'body': parsed, 'raw': response_body}
         except urllib.error.HTTPError as e:
-            body_text = e.read().decode() if e.fp else ''
+            raw = e.read() if e.fp else b''
+            body_text = raw.decode(errors='replace')
             try:
                 parsed_body = json.loads(body_text)
             except (json.JSONDecodeError, ValueError):
                 parsed_body = body_text
-            return {'status': e.code, 'body': parsed_body}
+            return {'status': e.code, 'body': parsed_body, 'raw': raw}
         except (urllib.error.URLError, ConnectionRefusedError, OSError) as e:
             last_error = e
             if attempt < retries:
@@ -784,8 +791,179 @@ def proxy_api_request(method, path, body=None, retries=None, retry_delay=1.5):
             else:
                 log.error(f'API proxy: {method} {path} failed after {retries+1} attempts: {e}')
         except Exception as e:
-            return {'status': 500, 'body': {'error': str(e)}}
-    return {'status': 503, 'body': {'error': f'Local server unavailable: {last_error}'}}
+            return synthetic_response(500, {'error': str(e)})
+    return synthetic_response(503, {'error': f'Local server unavailable: {last_error}'})
+
+
+def synthetic_response(status, body):
+    """A reply the daemon makes up itself, in the server's compact JSON."""
+    return {'status': status, 'body': body,
+            'raw': json.dumps(body, separators=(',', ':')).encode()}
+
+
+# ============================================================
+# Binary response frames
+# ============================================================
+#
+# A client that sends {"bin": 1} gets every notification for that request as
+# a binary frame instead of the JSON chunk wrapper (big-endian throughout):
+#   frame   = 0xB1 | request id u16 | chunk index u16 | chunk count u16 | slice
+#   payload = encoding u8 | HTTP status u16 | body     (slices concatenated)
+# Encodings: 0 plain, 1 raw deflate (wbits -15), 2 zlib stream (wbits 15)
+# with the preset dictionary named by the request's "zd". The zlib header's
+# DICTID lets the app catch a dictionary mismatch. The decoded body is the
+# local server's response bytes verbatim. 0xB1 is never '{', so the app tells
+# binary frames from JSON ones by the first byte.
+
+BIN_FRAME_MAGIC = 0xB1
+BIN_FRAME_HEADER = struct.Struct('>BHHH')
+BIN_ENC_PLAIN, BIN_ENC_DEFLATE, BIN_ENC_ZDICT = 0, 1, 2
+# Below these sizes compression overhead outweighs the savings.
+ZDICT_MIN_BODY = 64
+DEFLATE_MIN_BODY = 256
+
+# Preset deflate dictionaries by version. Frozen once shipped: the app bundles
+# identical bytes, so a change is a new version. server/ble/zdict/v1.bin is
+# the canonical copy (built by server/ble/tools/build_zdict.py); it is
+# embedded here, zlib-compressed, so every install path that updates this
+# script carries it.
+# BEGIN ZDICT V1
+ZDICT_V1_SHA256 = 'a38c4a31f48ecee01493407c80f7a92eea2095ee786171e29f35948f147b76b9'
+ZDICT_V1_B85 = (
+    'c-rkd{cqd2lK+Yz+z;=7#MP%Q8;1j2*WLIUCx-2`*WD`wTB2iZWJymSNpnH|_cudP5+%zYNz'
+    ';dWdo6Zbi=5#MXNJR>A^9W^XZB<!51wS=q~1N12WgzqGx?tQ8GOiUU+bt{t7CLj`S}c?XT!x'
+    '}KYT=z<ROe*4!l@QKI{ihXpqK_S+Zi#^U=lR^Vt3{z8roPan{671SCxnq37e#_-Z-2oXi#na'
+    'FDEswHSULe>jH3K5JM&Y5w&UX!FnG`6(jSYG_{<%kgwSn&Yh#5q>!zjy_GVKa5Xi@crf39$y'
+    'XNp94C2q)7q$X*{0U!!N^6FF?D#p1!~SZ+kKMeSAOyiZVs$(QtYM(olY5fRm348-%);TwfiS'
+    'sor6>GMe4kzg+|P)%E-Uv=asijqeHT1hfxx6zdeM_~>j4`>IfGt|rU<@LLa|1$j=#%Zuv+1X'
+    'ey9|8nx%#d2|R{pFZInUtp2?<b(P+0EkO^eIel7L(C2EwJIQu9uUKlhJSqO0buc<>mN*a2IT'
+    ';-z?rsS7GX{JqN@b25gw+$FFVd?ODPM{APZ60Cbb4Q8IY<E=bpp9r~SYBcFDhaQp5t%;GeRJ'
+    'O>Aw&Bu$y&3t@BRZ+rpg+fFVvWK%7EQCW2ibRopM;~igr_ZlMxdFd%gi;3fT9BHLF0Ze^d!h'
+    'v%K#A!#Old&2R6v>ymlsEIB9d-Oyv5h6(J?ecu*1N{MMdKZZPy<*^%o{7QnJI?_M!?AC2~X>'
+    '1%r#>^!@M!QqNsGn5TVly;xoir{fcMtqO55Uf#^?kCUs(;^LHrwzwFA@f{|$q=`>PWLv@G?)'
+    '&9>{^7J8ILB$qtqxxk+tqLe=C`ybS4+^+@X#tVEaqJEZOVrKXXE*Bd3-^Q5K9Cf4R4l*{kUl'
+    '=iqb?ofyM3)(hRiAH_YQ2`hhup8P2aJSHB(N%_`@#xE$KJzkZ%v?I*!NC)2V0JFM9KV8bnq!'
+    'MVP>3=?}8+)_W^hrf*9x0+6KrIRFD(KvoAaL{y`CfZ!);2)o#V9~;Y^+_rZg3R~N_&2zC@jE'
+    '82mnHUA9;lkqQ2>qH6VE5Gz1geB6nMps^3R#P4YMGnZZXRw4P$ak?F}V<x<RHKpOPSp?1XuF'
+    '*G2}^ZlC?>!2o4{N>b)q80MpVCa+_<k0?zNpn|(rPEXpB0RC|$lBMAmb}onbK8_Jn=G@9*dV'
+    'L7y^sb?)$ZL~g8m7cAU^Ts0l6*eUcZLhpEh(r1))Tm*B!O)dI{tW)J(o{i)w_rX48-X)5gXZ'
+    'fG;qsS%_^w4S<JTN1$D5~FtE`N`92LHg{DhW;sw$om8*`+O5tTwrE?n4`1Wz=y43yj0P51Tj'
+    '#;$cBt@gyL8jIa6L>Um9%l{=*;lYJqU3HCKG68ngFNW*87)Fb9vG}2X2QOD?2Glz2^js<%MF'
+    'YXbIT@8RT0kFkocBfdRs3a%YwF)+@cWW3$Rl88^FL8BoFjX4~B@D9+i#?znv_Okx3B9zo8A0'
+    'Bpu;!UT|A348*;L9WVA^;z8L=QZ_iV<ma<WT|GmwcGQ(OHr3TLv~Ih)th%-u8hMeDbS~POlJ'
+    'p)EW?f0vu98$!5!IxcqMEwqu9}PjqEcMnL|O;5RO%<6K(3$s_d)&SKIDjc*r%u;lX>cfe)7h'
+    'qeoU*Y?A6atSWdk*O)0NfPI_%Qb-TNI>MOf?vR<~DjLuJ5Oy8dWz>UC*azE(iepgd8<6KeC6'
+    '&=U+a3chks#aU=og465IbRXyuCt8{fNSes$6=5j==bS5wIk2>Nqh_{rl5nA9)gR#+sz5X<zR'
+    '=$GY?PBJTf`+q{*2lPR=}Sa^{}NffZps0eXE`1jX;>)PYcZgo=MBXd4%A(+0Fw8_;aUI#>6K'
+    'N$74BlhA)aOiieLViMpEiD?Jybz;(5#iX{1Nwrn=-0bfYlhEBNCZYeJ00g)nnVBj-1MG$*(='
+    'aZ>W0v3yWB~!74tfp4*5GfHGw?|70gZ*5FiuPW4qF{BMc=g`f%GvZf#W4kcqWa8EHESq^Ybi'
+    '4_aKIiF?@z>*d@sZMzK8yK2j1z5Z!{u^dRU=A%?B7u+-FnVh-{=VOK9Xi+f#|(A}yRq5pvSH'
+    'lg-uPk=jQzB^z?mAoML)NSZkP)_S==W9fNW8H1S;BKF?w54J}yaQWlyR!a&_?k9l3EF7&Iku'
+    '`H1-8)sg`7{@RE4?JoDh#%xEHE0k2#@YPgL6t**wvZ^NN*C9!N~>aP=p3Qro2|Wmdh<p!KEN'
+    'gYbNy?lI_J0o1>I0F@Wzn*mg1bM3xW)1VK$?+^Lbnn@DJp}wtjbalUX)ikg~*bVo2SKvzN@A'
+    's}{_a5(B_8;`Fb*TN`wS+tDT^nGp)0d!-cK532=b8c<ZPl0dGhK+fRP=$SfEQ`kTEW|1-(Gg'
+    '_@$F^*5#L_I{fM9iN$!s@1x$cK-yUY}dy>$b*cXnb$}<E!mqHc96w=$&gMH#MB<?tl!?;NMU'
+    '3xbUQ&tT44U_$PjR%tEo5%;8VY=H^8)uuPSZG~51`e9Qnt(ps1?1|K7gexCJA)Ko%)fE0VVc'
+    'rylvV_y9BAx%X~L|j%-XT?5qtM^$tnO!p6}x?(0`l-K{fO<irtH`w#!N7p8^&5Mk?YQc-w;4'
+    'Rz26Ja>>s;%u+hSiZLS{c@ww5W98LcCe&@fVVGAyK0nD`Vka~$xx(YMK{-RatXY%=@CI6L4L'
+    'Md8;cB!2IS8mP3r9#y6Ec>~Nn)?UaJve>^HXzXSvD-t+P9B}n{2{|TI)7TJg01diNIifdHnt'
+    ')lO*wyl)83AV}~vMuGUe{WUOODJA}6`^uv;;_T83M@35rP(!0eHklxX1xHP!Ms<^#n6?DC*e'
+    '4+kf0=aw*4Hkalau*+E$p+1#mp8)j`50T^jSW(^S4^2^zoVIr4&+BSSWyz&MNSN}sF7k%IdQ'
+    '}6=xEMhj^MeFN5FFH-b&RVe1~+aqp)B!ibIDcSbgV{F}pnr>=@0boFGixz>1gSG}va$)!P}@'
+    'W~Zm~4v}r$;9Tb?0d>6qjgHyd>BI4Q-ChUf#=Cggkqz0mdR;R=D4_Wwl7|k?NCIEu!O9amvU'
+    'GzEC@(rnG5veS7N-F6G4x#;OIc8!*>t4QhB|jrx*@3qzCdDfmApja=QbS?-wVL}Jy!w}^fts'
+    'ZrmF8UbciqIC&eO#f%G3)?1!+xB?c<}0q!6OB~?|wNuv;!mBaa6<1xv9iemy;v23N3`e0<>a'
+    '*?@m^g48ElS&BnsV@Q&!Qx9LfRffQw^}cr^kj*IPBM&1?D>!46l&w}^CXVZgn~W6qx>)@0X4'
+    '^^7utrdja%%Fy((z0zsu$Rb0lvnb~?TnoSMzNJ2GtI{VxzV)V`rBhQg}nZ^*y6`M>1^#BuW('
+    '^sKI-Ys#C?U^l3I%X#dM{&V%w7Hqxwd>Z5b+!?im>2Eoqmf`;y^ZAJ?Y9;V?b7FZ)=g)+t7O'
+    '&;IHb~B!+U@-aTj?g-t~wFKu&?Jz93y8+vrJWc{`Tr2i<<@Vz}mBk<T2^1EUKdMdhWPgDE+P'
+    '|{QXQ-rPMa2YQ^0bF;&BSDN|KBtc|H!q3%UY)i7VmRCPko##HSH<3&u>Fa@SgGt$Z+jkhsK@'
+    'z~}72X(NQ%CePmZBnOA{cY$9WrRb7Yhb4-s?v`BTwLn1Z;2P!B#L}Y3kG=>nD=moMjK$e^FZ'
+    '$9vPVdFA<wiAj8ygV(d1gAm~JN+T<6A8zu?Bkbys}I7OuF5?{y8sK*=|*tCjfYx-h^+7zZ_c'
+    't!s1-<BRm)QySIKElUIJZy?weU9;+tsTrDO;Y9{Wh%jN4r;xAw7YQUul?u&EH_MTP7BP^%5H'
+    'H1y1+XO&I~z=>(okAa$Z-hdGnjUDI{y<iMgcd_6Gj<wOvrXBv>haEpc(?w2Q2*MDHSk~B`XO'
+    'c<gJ9)aob4h15Itkrfvgy2i1U0Pe2_9Nrq(|NDa3VmI=iavV}5i4Q3Oax~<qdxZQ!F3AoD*j'
+    'VTD4O1i`X1`s@^xqnOkU3&1+jRep*CVrE^l@uwBA@70lU0Qa4ezxI#i-2Lr=nKRac%=sC8B-'
+    '^Wv1G+n48L}8t%2DUaUTOGR|{mwTk3iQ$>Nk*(%mMeKIlkPP#8ewxiicTo~poq0^X=@6F_y3'
+    'MW`w)zg<Lb4h7y0mNw9glNLZ0)R#a}1S_ks>_%joMfTbYyksNX8)dDH0^}20vslR4Mp;_FJ8'
+    'I!Iro209R74YA3&@?66JrGI+F9Uz=h&8MAhwfjGoL*sfjHUmiMK5-aayL;@9T!y*Us22GdAQ'
+    'oEC1jD2(!PUyu`xjHX>HPdyt5#TB@pc6{TzJP|=!H)IC)C;LQ$G(ecuoq4(6?x#&$Q+CC~Ei'
+    'NjP(v)k89aLm>Y6{AT--$$j-uCyMY((M`=NLK6Z&c$p}F>s5`Yi`76clCrzx;?emx4M1R!uT'
+    'i2Sk0}p&~n8Kcie)tcbmnPy$bi6!O!Gxlk%kmeB5T9i{-z1)ectKJ>7T?xW8JlYwd>*K&*qe'
+    '49SY(A;d@+ECHt%=jT7SF{OE`gtbLhkL?LJl<_3M=96jkVwvCdLOXm2Xj!VyZ)E54vQ=g41z'
+    '-WVs=)Wb7H^Z=5XNA|$pDwMTS{mJ^1Nf>tZqIwAiRKJP-%NX0xIyu8{$}5W6vO1{qjt{N5Zl'
+    '!(&2J{<&|{@Yo6R)U?jt<{8cHh^e>FfM;j!Z<hMSRj@rSHdKHGL%}lHi;d#qn#UIqk%CT|FL'
+    'G{gxOZw8xlT2xf&C+{mPVc3B^org+G~gS!-MQmsOIQG4B$YUbzqSSM*6?@vO_+Nyc+eo$t1T'
+    'uBX1jKhu-VAPrOy12v9vQGx{Dni02U}<S`R)6azjCO<eLR@%uhvZ9@i;`W%k&;cDy~sLtU+J'
+    '^t(Ncxk7fIKZyvAU%$^^o}H9q_4J;hLa2s^Vu|PM3@3Pb-q%IyKwoDj{1<<Qz@=F0dy;+ea&'
+    'oyy&{Fsj7>Vp%R|bt<)ObkDT0`MBZ&Vmi^|mT+<pEO(i4R4<wY!gHT0p}!MSmqyE<*Mw!4dp'
+    '2hrnndPMsfe0B4xeZP?}G>a-OCj_)>F1X~*XxHb3Os4KZr13R&Nm8?pT6Gg>WeD0<ow9?O2^'
+    ';|XBMG8EX$83{+kHAYN4H$C?Nl6LQ6dIow*kVR}W_(*njqq%gO}?k`%kpfxJc)t{bF>ywv@^'
+    'jNH3}w<5LK;qqWR_YSs16+5iQl~>|8SE4a04elt7TL#i5@J8*aVo`HZJoH?aHq%cTDPARX?z'
+    'vd>MXye-d7g?t~iumD>oo-{7QkMLQZfEO3|i^mWAI)3#QVj7i%l8VNC=;KlU=W?|+Wy4=bG+'
+    '#^9_|mmj!4wZG+T_Bc1T~NF3hCfLP1&gIb&y|sNw6asi~t*Q>6?O7dV)waRVkhvFqvq5_O5|'
+    'FanSH*B@@j+4=4JvlrQqa@sJdDzehW&9=@zX_tEB)_8~H?1vX|Sy3*;388TaZFrpX6HXa<>4'
+    'if<GV;=Qg9E^|jRHv;gEtuHIw&!MJ3M<QAqmasvSony!`0@{-2TzZ2KiJ$8NA%P?L^PEtjXz'
+    'c?>O1w<EujmN1Uz<Ljc3_rr`w1Fbru-1D@J^&594hfpl-Z%T8eN+;=6idUF?P;1Q|I}DFhpz'
+    'a>FLysYFpWl`<%x)T$}2A=bm<r~JADV})IX`E}#s*NqDnNmX`{<%W@$GHmD3@ypnuXnY9cyG'
+    'D89tR+$O@Pa{Yljj1nX-bNPP;L}rSL41E@A@-b*+tx5w22X{A~a)oQ8n+}<*Fu%;W>+m9w4t'
+    '|%ahxg6J^Y8u(#v7ibV*Q-g_X`BwMdBPe(quF&EWWezl20o*U=EQTY|K)z4?<HhgOi@!eiU`'
+    '8~9}f#;+csclO^@vewcR~$aAkk^o&6#cNNC~`g9kj1ziYxvn#%%j*f?OI|WB+f5N?8;Oupbr'
+    '$E)X7z4L+r*%Mb&L}6^nKMWwVwfiy|NL?0h>1PtZ{n(`aNfvWSFfyX%w_6GCy!=lKzh)djhB'
+    'n4vy+YY+Ad`uE&I*k@sl?BkFz<^YvBvF}z>%zMgQI{!=|X1Zl(IYm=xn$OQWjs+JWcq-qoIS'
+    'x19l#Rhj^@itto{8rmm1E+OUy<{x7Ooz_6&aesTexVzE<H2?cK*HV&q|MUI<w%TAVpzuf63S'
+    'X701|E_k3yfE&jT;-rg(sB9z<nUwq5>wNd=qD1L1e|Fn(bABLUsu>'
+)
+# END ZDICT V1
+
+
+def load_zdicts():
+    """Dictionaries that decode to their recorded digest; a bad one is left
+    out, which only means its clients get encoding 1 instead."""
+    zdicts = {}
+    try:
+        data = zlib.decompress(base64.b85decode(ZDICT_V1_B85))
+        if hashlib.sha256(data).hexdigest() == ZDICT_V1_SHA256:
+            zdicts[1] = data
+        else:
+            log.error('Deflate dictionary v1 failed its checksum; not using it')
+    except Exception as e:
+        log.error(f'Deflate dictionary v1 unavailable: {e}')
+    return zdicts
+
+
+ZDICTS = load_zdicts()
+
+
+def encode_bin_payload(status, raw, zdict=None):
+    """Build a binary-frame payload; returns (payload, encoding). Compresses
+    only when that makes the body smaller."""
+    encoding, body = BIN_ENC_PLAIN, raw
+    candidate = None
+    if zdict is not None and len(raw) > ZDICT_MIN_BODY:
+        comp = zlib.compressobj(9, zlib.DEFLATED, 15, zdict=zdict)
+        candidate, candidate_encoding = comp.compress(raw) + comp.flush(), BIN_ENC_ZDICT
+    elif zdict is None and len(raw) > DEFLATE_MIN_BODY:
+        comp = zlib.compressobj(9, zlib.DEFLATED, -15)
+        candidate, candidate_encoding = comp.compress(raw) + comp.flush(), BIN_ENC_DEFLATE
+    if candidate is not None and len(candidate) < len(raw):
+        encoding, body = candidate_encoding, candidate
+    return bytes([encoding]) + struct.pack('>H', status & 0xFFFF) + body, encoding
+
+
+def bin_frames(request_id, payload, max_frame):
+    """Split a payload into frames of at most `max_frame` bytes. Raises
+    ValueError past the u16 chunk count."""
+    slice_len = max(1, max_frame - BIN_FRAME_HEADER.size)
+    count = max(1, -(-len(payload) // slice_len))
+    if count > 0xFFFF:
+        raise ValueError(f'{len(payload)}B needs {count} frames')
+    rid = request_id & 0xFFFF
+    return [
+        BIN_FRAME_HEADER.pack(BIN_FRAME_MAGIC, rid, idx, count)
+        + payload[idx * slice_len:(idx + 1) * slice_len]
+        for idx in range(count)
+    ]
 
 
 # ============================================================
@@ -1408,6 +1586,13 @@ class APIRequestCharacteristic(Characteristic):
         # chunk count is the entire bill; deflating repetitive JSON cuts
         # it 8-15x. Clients that never send the flag get plain bodies.
         wants_gz = bool(request.get('gz'))
+        # Binary frames (see bin_frames); "zd" names the preset dictionary
+        # the app bundles. Without "bin" replies are exactly as before.
+        wants_bin = bool(request.get('bin'))
+        try:
+            zdict = ZDICTS.get(int(request.get('zd') or 0))
+        except (TypeError, ValueError):
+            zdict = None
 
         log.info(f'API proxy: {method} {path} (id={request_id})')
 
@@ -1415,63 +1600,12 @@ class APIRequestCharacteristic(Characteristic):
             t0 = time.monotonic()
             result = proxy_api_request(method, path, body)
             api_ms = int((time.monotonic() - t0) * 1000)
-            response = {
-                'id': request_id,
-                'status': result['status'],
-                'body': result['body'],
-            }
-            # Compress the body alone (not the envelope) as raw DEFLATE —
-            # wbits=-15 matches Apple's COMPRESSION_ZLIB so the app can
-            # decode with NSData.decompressed(using: .zlib). Worker thread
-            # only; zlib on the GLib loop would stall GATT.
-            if wants_gz:
-                body_bytes = json.dumps(result['body']).encode()
-                if len(body_bytes) > 512:
-                    comp = zlib.compressobj(6, zlib.DEFLATED, -15)
-                    deflated = comp.compress(body_bytes) + comp.flush()
-                    response = {
-                        'id': request_id,
-                        'status': result['status'],
-                        'gz': True,
-                        'body_gz': base64.b64encode(deflated).decode('ascii'),
-                    }
-            response_json = json.dumps(response).encode()
-
-            # Send response, chunking if it exceeds the negotiated BLE MTU.
             # ATT notification overhead is 3 bytes.
             max_msg = self._client_mtu - 8
-            if len(response_json) <= max_msg:
-                frames = [response_json]
+            if wants_bin:
+                frames, size_note = self._bin_frames(request_id, result, zdict, max_msg)
             else:
-                # Binary-search split: find largest data slices whose
-                # JSON-wrapped chunk messages fit within max_msg.
-                remaining = response_json.decode('utf-8', errors='replace')
-                chunks = []
-                while remaining:
-                    test_msg = json.dumps({'id': request_id, 'chunks': 0, 'chunk': 0, 'data': remaining})
-                    if len(test_msg.encode()) <= max_msg:
-                        chunks.append(remaining)
-                        break
-                    lo, hi = 1, len(remaining)
-                    while lo < hi:
-                        mid = (lo + hi + 1) // 2
-                        test_msg = json.dumps({'id': request_id, 'chunks': 0, 'chunk': 0, 'data': remaining[:mid]})
-                        if len(test_msg.encode()) <= max_msg:
-                            lo = mid
-                        else:
-                            hi = mid - 1
-                    chunks.append(remaining[:lo])
-                    remaining = remaining[lo:]
-                total = len(chunks)
-                frames = [
-                    json.dumps({
-                        'id': request_id,
-                        'chunks': total,
-                        'chunk': idx,
-                        'data': chunk_data,
-                    }).encode()
-                    for idx, chunk_data in enumerate(chunks)
-                ]
+                frames, size_note = self._json_frames(request_id, result, wants_gz, max_msg)
 
             # Per-request transfer economics: payload size, negotiated MTU,
             # frame count, local API time, and the pacing floor of the BLE
@@ -1479,7 +1613,7 @@ class APIRequestCharacteristic(Characteristic):
             # slow phone session spends its time.
             log.info(
                 f'API proxy: {method} {path} id={request_id} -> '
-                f"{result['status']} {len(response_json)}B "
+                f"{result['status']} {size_note} "
                 f'mtu={self._client_mtu} frames={len(frames)} '
                 f'api={api_ms}ms xfer_floor={len(frames) * self.CHUNK_STAGGER_MS}ms'
             )
@@ -1491,6 +1625,84 @@ class APIRequestCharacteristic(Characteristic):
         # Run the blocking HTTP proxy call in a background thread
         # so the GLib main loop stays responsive for BLE operations
         threading.Thread(target=do_request, daemon=True).start()
+
+    def _bin_frames(self, request_id, result, zdict, max_msg):
+        """Binary frames for one reply (worker thread: compression here keeps
+        zlib off the GLib loop)."""
+        raw = result.get('raw', b'')
+        payload, encoding = encode_bin_payload(result['status'], raw, zdict)
+        try:
+            rid = int(request_id)
+        except (TypeError, ValueError):
+            rid = 0
+        try:
+            frames = bin_frames(rid, payload, max_msg)
+        except ValueError as e:
+            log.error(f'API proxy: id={request_id} reply too large for BLE: {e}')
+            payload, encoding = encode_bin_payload(
+                502, b'{"error":"Response too large for Bluetooth"}')
+            frames = bin_frames(rid, payload, max_msg)
+        return frames, f'{len(raw)}B enc={encoding} sent={len(payload) - 3}B'
+
+    def _json_frames(self, request_id, result, wants_gz, max_msg):
+        """JSON envelope frames: the reply format for clients without "bin"."""
+        response = {
+            'id': request_id,
+            'status': result['status'],
+            'body': result['body'],
+        }
+        # Compress the body alone (not the envelope) as raw DEFLATE —
+        # wbits=-15 matches Apple's COMPRESSION_ZLIB so the app can
+        # decode with NSData.decompressed(using: .zlib). Worker thread
+        # only; zlib on the GLib loop would stall GATT.
+        if wants_gz:
+            body_bytes = json.dumps(result['body']).encode()
+            if len(body_bytes) > 512:
+                comp = zlib.compressobj(6, zlib.DEFLATED, -15)
+                deflated = comp.compress(body_bytes) + comp.flush()
+                response = {
+                    'id': request_id,
+                    'status': result['status'],
+                    'gz': True,
+                    'body_gz': base64.b64encode(deflated).decode('ascii'),
+                }
+        response_json = json.dumps(response).encode()
+
+        # Send response, chunking if it exceeds the negotiated BLE MTU.
+        if len(response_json) <= max_msg:
+            frames = [response_json]
+        else:
+            # Binary-search split: find largest data slices whose
+            # JSON-wrapped chunk messages fit within max_msg.
+            remaining = response_json.decode('utf-8', errors='replace')
+            chunks = []
+            while remaining:
+                test_msg = json.dumps({'id': request_id, 'chunks': 0, 'chunk': 0, 'data': remaining})
+                if len(test_msg.encode()) <= max_msg:
+                    chunks.append(remaining)
+                    break
+                lo, hi = 1, len(remaining)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    test_msg = json.dumps({'id': request_id, 'chunks': 0, 'chunk': 0, 'data': remaining[:mid]})
+                    if len(test_msg.encode()) <= max_msg:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                chunks.append(remaining[:lo])
+                remaining = remaining[lo:]
+            total = len(chunks)
+            frames = [
+                json.dumps({
+                    'id': request_id,
+                    'chunks': total,
+                    'chunk': idx,
+                    'data': chunk_data,
+                }).encode()
+                for idx, chunk_data in enumerate(chunks)
+            ]
+
+        return frames, f'{len(response_json)}B'
 
     def _store_and_send(self, request_id, frames):
         """Main-context only: cache the frames for resend, then send them."""

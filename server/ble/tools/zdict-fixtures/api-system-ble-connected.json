@@ -1,0 +1,1 @@
+{"archiving":false,"configured":true,"health":{"code":"connected","guidance":"Authenticated vehicle telemetry is flowing.","label":"Connected","severity":"green","since_ts":1700000000},"last_success_ts":1700000000,"radio_owner":null,"sample_count_10min":20,"seconds_ago":10}
