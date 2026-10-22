@@ -489,14 +489,29 @@ async fn serve_with_common_layers(
         "SentryUSB ready to serve requests",
     );
 
-    axum::serve(
+    let draining = Arc::new(tokio::sync::Notify::new());
+    let server = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await
-    .expect("server error");
+    .with_graceful_shutdown({
+        let draining = draining.clone();
+        async move { shutdown_signal().await; draining.notify_one(); }
+    });
+    // The drain waits on every in-flight request (downloads, the archive
+    // loop's post-archive update handoff), which otherwise held reboots until
+    // systemd's 90s SIGKILL. Exit directly: runtime teardown would still wait
+    // on blocking tasks.
+    tokio::select! {
+        result = server => result.expect("server error"),
+        _ = async { draining.notified().await; tokio::time::sleep(SHUTDOWN_DRAIN).await } => {
+            tracing::warn!("Requests still open {}s after shutdown signal; exiting", SHUTDOWN_DRAIN.as_secs());
+            std::process::exit(0);
+        }
+    }
 }
+
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(5);
 
 async fn shutdown_signal() {
     // systemd stops the service with SIGTERM — without listening for it
