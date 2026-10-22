@@ -214,9 +214,10 @@ async fn coordinate(state: &AppState) -> Result<()> {
         state.hub.broadcast("update_status", &serde_json::json!({"status":"restarting"}));
         sentryusb_shell::run("reboot", &[]).await?;
         // Keep admission closed until shutdown; if reboot never happens, report
-        // failure instead of leaving an everlasting in-progress state.
-        tokio::time::sleep(Duration::from_secs(90)).await;
-        anyhow::bail!("Device did not reboot after update")
+        // failure instead of leaving an everlasting in-progress state. A slow
+        // shutdown must not mark the attempt failed: the receipt helper and
+        // startup verification both require "awaiting_reboot".
+        Err(crate::update::await_reboot().await)
     }.await;
     if let Err(e) = result {
         if attempt.phase == "preparing" {

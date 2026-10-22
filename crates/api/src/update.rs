@@ -158,8 +158,8 @@ pub async fn run_update(
 
                 match sentryusb_shell::run("reboot", &[]).await {
                     Ok(_) => {
-                        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
-                        hub.broadcast("update_status", &serde_json::json!({"status":"error", "error":"Device did not reboot after update"}));
+                        let e = await_reboot().await;
+                        hub.broadcast("update_status", &serde_json::json!({"status":"error", "error":e.to_string()}));
                     }
                     Err(e) => hub.broadcast("update_status", &serde_json::json!({"status":"error", "error":e.to_string()})),
                 }
@@ -172,6 +172,28 @@ pub async fn run_update(
     });
 
     (StatusCode::OK, Json(serde_json::json!({"status": "started"})))
+}
+
+/// Returns only if a requested reboot never got under way. Shutdown can stop
+/// this server long after the deadline (its graceful drain waits on open
+/// connections), so a system still stopping is progressing, not failed.
+pub(crate) async fn await_reboot() -> anyhow::Error {
+    await_reboot_with(std::time::Duration::from_secs(90), std::time::Duration::from_secs(5), system_stopping).await
+}
+
+async fn await_reboot_with<F: std::future::Future<Output = bool>>(
+    deadline: std::time::Duration, poll: std::time::Duration, mut stopping: impl FnMut() -> F,
+) -> anyhow::Error {
+    tokio::time::sleep(deadline).await;
+    while stopping().await { tokio::time::sleep(poll).await; }
+    anyhow::anyhow!("Device did not reboot after update")
+}
+
+async fn system_stopping() -> bool {
+    // is-system-running exits non-zero for every state except "running".
+    let probe = tokio::process::Command::new("systemctl").arg("is-system-running").kill_on_drop(true).output();
+    matches!(tokio::time::timeout(std::time::Duration::from_secs(10), probe).await,
+        Ok(Ok(out)) if String::from_utf8_lossy(&out.stdout).trim() == "stopping")
 }
 
 /// Default OTA source.
@@ -1122,5 +1144,19 @@ mod hardware_identity_tests {
         assert!(hardware_serial(["\0", "0000000000000000"], "Hardware : BCM2712\nSerial : 00000000").is_none());
         assert!(hardware_serial(["unknown", "0x0000"], "").is_none());
         assert_eq!(hardware_serial(["0000000000000000"], "Serial : 123456789abcdef0").as_deref(), Some("123456789abcdef0"));
+    }
+
+    #[tokio::test]
+    async fn slow_shutdown_is_not_reported_as_a_failed_reboot() {
+        use std::time::Duration;
+        let ms = Duration::from_millis;
+        // Still stopping at the deadline: keep waiting for systemd to end us.
+        let pending = await_reboot_with(ms(1), ms(1), || async { true });
+        assert!(tokio::time::timeout(ms(50), pending).await.is_err());
+        // Shutdown never began, or was abandoned: report the failure.
+        let polls = std::cell::Cell::new(0);
+        let e = await_reboot_with(ms(1), ms(1), || { polls.set(polls.get() + 1); async { polls.get() < 3 } }).await;
+        assert_eq!(e.to_string(), "Device did not reboot after update");
+        assert_eq!(polls.get(), 3);
     }
 }
