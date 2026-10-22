@@ -630,9 +630,9 @@ type LatestSample = (
     Option<(f64, i64)>,   // exterior_temp_c + ts
     Option<i64>,          // hvac_on
     Option<(f64, i64)>,   // tire_fl_psi + ts
-    Option<f64>,          // tire_fr_psi
-    Option<f64>,          // tire_rl_psi
-    Option<f64>,          // tire_rr_psi
+    Option<(f64, i64)>,   // tire_fr_psi + ts
+    Option<(f64, i64)>,   // tire_rl_psi + ts
+    Option<(f64, i64)>,   // tire_rr_psi + ts
     Option<f64>,          // odometer_mi
     Option<String>,       // location_name
     // Coordinates remain internal; derive at_home against the current geofence.
@@ -644,6 +644,27 @@ type LatestSample = (
 /// Cache below the sampler cadence to limit database reads from panel polling.
 static LATEST_SAMPLE_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), Option<LatestSample>> =
     crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(10));
+
+/// Volatile dashboard-field ages in seconds, independent of the
+/// sample-envelope age. `tires` is front-left's age, kept for the web UI and
+/// older apps; `tire_fl`..`tire_rr` give each tire its own.
+fn field_secs_ago(
+    now: i64,
+    [battery_pct, interior_temp_c, exterior_temp_c]: [&Option<(f64, i64)>; 3],
+    [fl, fr, rl, rr]: [&Option<(f64, i64)>; 4],
+) -> serde_json::Value {
+    let age = |pair: &Option<(f64, i64)>| pair.map(|(_, t)| (now - t).max(0));
+    serde_json::json!({
+        "battery_pct": age(battery_pct),
+        "interior_temp_c": age(interior_temp_c),
+        "exterior_temp_c": age(exterior_temp_c),
+        "tires": age(fl),
+        "tire_fl": age(fl),
+        "tire_fr": age(fr),
+        "tire_rl": age(rl),
+        "tire_rr": age(rr),
+    })
+}
 
 pub async fn ble_latest_sample(
     State(s): State<AppState>,
@@ -739,11 +760,11 @@ pub async fn ble_latest_sample(
                     latest_col_f64_aged("interior_temp_c"),
                     latest_col_f64_aged("exterior_temp_c"),
                     latest_col_i64("hvac_on"),
-                    // TPMS fields share one polling timestamp.
+                    // Each tire keeps its own timestamp: a sensor can miss polls.
                     latest_col_f64_aged("tire_fl_psi"),
-                    latest_col_f64("tire_fr_psi"),
-                    latest_col_f64("tire_rl_psi"),
-                    latest_col_f64("tire_rr_psi"),
+                    latest_col_f64_aged("tire_fr_psi"),
+                    latest_col_f64_aged("tire_rl_psi"),
+                    latest_col_f64_aged("tire_rr_psi"),
                     latest_col_f64("odometer_mi"),
                     latest_col_string("location_name"),
                     latest_col_f64("latitude"),
@@ -784,8 +805,6 @@ pub async fn ble_latest_sample(
             longitude,
             body_controller_ts,
         )) => {
-            // Field ages remain independent of the sample-envelope age.
-            let age = |pair: &Option<(f64, i64)>| pair.map(|(_, t)| (now - t).max(0));
             // Return only a derived at-home boolean. Read the uncached geofence
             // only when a fix exists so moves apply on the next request.
             let at_home = latitude
@@ -805,19 +824,17 @@ pub async fn ble_latest_sample(
                 "exterior_temp_c": exterior_temp_c.map(|(v, _)| v),
                 "hvac_on": hvac_on.map(|v| v != 0),
                 "tire_fl_psi": tire_fl_psi.map(|(v, _)| v),
-                "tire_fr_psi": tire_fr_psi,
-                "tire_rl_psi": tire_rl_psi,
-                "tire_rr_psi": tire_rr_psi,
+                "tire_fr_psi": tire_fr_psi.map(|(v, _)| v),
+                "tire_rl_psi": tire_rl_psi.map(|(v, _)| v),
+                "tire_rr_psi": tire_rr_psi.map(|(v, _)| v),
                 "odometer_mi": odometer_mi,
                 "location_name": location_name,
                 "at_home": at_home,
-                // Volatile dashboard-field ages.
-                "field_secs_ago": {
-                    "battery_pct": age(&battery_pct),
-                    "interior_temp_c": age(&interior_temp_c),
-                    "exterior_temp_c": age(&exterior_temp_c),
-                    "tires": age(&tire_fl_psi),
-                },
+                "field_secs_ago": field_secs_ago(
+                    now,
+                    [&battery_pct, &interior_temp_c, &exterior_temp_c],
+                    [&tire_fl_psi, &tire_fr_psi, &tire_rl_psi, &tire_rr_psi],
+                ),
                 "sentry_mode": sentry_mode,
                 "charging_state": charging_state,
                 "shift_state": shift_state,
@@ -1069,6 +1086,28 @@ mod tests {
         )
         .unwrap();
         assert_eq!(authenticated_activity(&conn, 900), (100, 0));
+    }
+
+    #[test]
+    fn each_tire_reports_its_own_age() {
+        let ages = field_secs_ago(
+            1_000,
+            [&Some((80.0, 990)), &None, &Some((12.0, 1_005))],
+            [&Some((42.0, 900)), &Some((41.5, 700)), &None, &Some((40.0, 999))],
+        );
+        assert_eq!(
+            ages,
+            serde_json::json!({
+                "battery_pct": 10,
+                "interior_temp_c": null,
+                "exterior_temp_c": 0,
+                "tires": 100,
+                "tire_fl": 100,
+                "tire_fr": 300,
+                "tire_rl": null,
+                "tire_rr": 1,
+            })
+        );
     }
 
     #[test]

@@ -103,7 +103,12 @@ interface BleLatestSample {
     battery_pct?: number | null
     interior_temp_c?: number | null
     exterior_temp_c?: number | null
+    /** Front-left age; kept for older clients. */
     tires?: number | null
+    tire_fl?: number | null
+    tire_fr?: number | null
+    tire_rl?: number | null
+    tire_rr?: number | null
   } | null
 }
 
@@ -1105,10 +1110,10 @@ function TelemetryOutputPanel({
               <div className="mt-1 border-t border-white/5 pt-1.5 text-[10px] uppercase tracking-wider text-slate-600">
                 Tire pressure ({pressureBar ? "bar" : "psi"})
               </div>
-              <Row label="Front left" value={fmtPressure(sample.tire_fl_psi, pressureBar)} age={sample.field_secs_ago?.tires} />
-              <Row label="Front right" value={fmtPressure(sample.tire_fr_psi, pressureBar)} age={sample.field_secs_ago?.tires} />
-              <Row label="Rear left" value={fmtPressure(sample.tire_rl_psi, pressureBar)} age={sample.field_secs_ago?.tires} />
-              <Row label="Rear right" value={fmtPressure(sample.tire_rr_psi, pressureBar)} age={sample.field_secs_ago?.tires} />
+              <Row label="Front left" value={fmtPressure(sample.tire_fl_psi, pressureBar)} age={sample.field_secs_ago?.tire_fl} />
+              <Row label="Front right" value={fmtPressure(sample.tire_fr_psi, pressureBar)} age={sample.field_secs_ago?.tire_fr} />
+              <Row label="Rear left" value={fmtPressure(sample.tire_rl_psi, pressureBar)} age={sample.field_secs_ago?.tire_rl} />
+              <Row label="Rear right" value={fmtPressure(sample.tire_rr_psi, pressureBar)} age={sample.field_secs_ago?.tire_rr} />
             </>
           )}
           {/* Three mutually-exclusive context messages for the stale
