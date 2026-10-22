@@ -253,11 +253,8 @@ pub async fn auth_middleware(
     // are set, and an unclaimed Pi serves nothing. Anything new that relays
     // remote requests to loopback (a tunnel, a reverse proxy) has to do the
     // same or this bypass becomes an open door.
-    if let Some(addr) = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>() {
-        // Canonicalize IPv4-mapped IPv6 on dual-stack listeners.
-        if addr.ip().to_canonical().is_loopback() {
-            return next.run(req).await;
-        }
+    if is_loopback(&req) {
+        return next.run(req).await;
     }
 
     // The frontend needs these endpoints before it can choose login or setup.
@@ -281,20 +278,53 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
+    if has_valid_session(&auth, &req) {
+        return next.run(req).await;
+    }
+    unauthorized()
+}
+
+/// Login gate for what is served outside `/api`: dashcam clips, the drive
+/// files under `/fs`, and the memory page. It is attached to those services
+/// themselves rather than matched by path in `auth_middleware`, so no
+/// spelling of a URL that reaches them can skip it. Same rules as the API:
+/// loopback and a valid session pass.
+pub async fn require_login(
+    axum::extract::State(auth): axum::extract::State<AuthState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if !auth.auth_required() || is_loopback(&req) || has_valid_session(&auth, &req) {
+        return next.run(req).await;
+    }
+    unauthorized()
+}
+
+/// Puts everything `router` serves, its fallback included, behind
+/// `require_login`.
+pub fn login_gated(auth: AuthState, router: axum::Router) -> axum::Router {
+    router.layer(axum::middleware::from_fn_with_state(auth, require_login))
+}
+
+/// True for requests from this Pi itself (see the note in `auth_middleware`).
+fn is_loopback(req: &Request) -> bool {
+    req.extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        // Canonicalize IPv4-mapped IPv6 on dual-stack listeners.
+        .is_some_and(|addr| addr.ip().to_canonical().is_loopback())
+}
+
+fn has_valid_session(auth: &AuthState, req: &Request) -> bool {
     let cookie_header = req
         .headers()
         .get("cookie")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
+    extract_cookie(cookie_header, SESSION_COOKIE_NAME)
+        .is_some_and(|token| auth.validate_session(token))
+}
 
-    let token = extract_cookie(cookie_header, SESSION_COOKIE_NAME);
-
-    if let Some(token) = token {
-        if auth.validate_session(token) {
-            return next.run(req).await;
-        }
-    }
-
+fn unauthorized() -> Response {
     let body = serde_json::json!({"error": "Authentication required"});
     let mut response = axum::response::Json(body).into_response();
     *response.status_mut() = StatusCode::UNAUTHORIZED;
@@ -478,4 +508,97 @@ pub async fn handle_auth_check(
         "authenticated": authenticated,
         "auth_required": auth_required,
     })))
+}
+
+#[cfg(test)]
+mod media_gate_tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::routing::get;
+    use tower::ServiceExt;
+
+    fn auth(username: &str, password: &str) -> AuthState {
+        AuthState {
+            inner: std::sync::Arc::new(AuthInner {
+                username: username.into(),
+                password: password.into(),
+                sessions: RwLock::new(HashMap::new()),
+                sessions_file: PathBuf::new(),
+            }),
+        }
+    }
+
+    /// Laid out like the real server: a media mount, a gated page outside
+    /// /api, and the SPA fallback.
+    fn app(auth: &AuthState) -> axum::Router {
+        axum::Router::new()
+            .nest_service(
+                "/TeslaCam",
+                login_gated(auth.clone(), axum::Router::new().fallback(|| async { "clip" })),
+            )
+            .route(
+                "/memory",
+                get(|| async { "memory" }).layer(axum::middleware::from_fn_with_state(
+                    auth.clone(),
+                    require_login,
+                )),
+            )
+            .fallback(|| async { "spa" })
+    }
+
+    async fn get_body(app: axum::Router, path: &str, cookie: Option<&str>, peer: Option<&str>) -> (StatusCode, String) {
+        let mut req = Request::builder().uri(path);
+        if let Some(cookie) = cookie {
+            req = req.header("cookie", cookie);
+        }
+        let mut req = req.body(Body::empty()).unwrap();
+        if let Some(peer) = peer {
+            req.extensions_mut()
+                .insert(axum::extract::ConnectInfo::<std::net::SocketAddr>(peer.parse().unwrap()));
+        }
+        let res = app.oneshot(req).await.unwrap();
+        let status = res.status();
+        let body = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+        (status, String::from_utf8_lossy(&body).into_owned())
+    }
+
+    const CLIP: &str = "/TeslaCam/SavedClips/2024-01-01_12-00-00/2024-01-01_11-59-00-front.mp4";
+
+    #[tokio::test]
+    async fn media_and_memory_need_the_web_login_when_it_is_set() {
+        let auth = auth("admin", "secret");
+        for path in [CLIP, "/TeslaCam", "/TeslaCam/", "/memory"] {
+            let (status, body) = get_body(app(&auth), path, None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} served without login: {body}");
+            let (status, _) = get_body(app(&auth), path, Some("sentryusb_session=forged"), None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} accepted a forged session");
+        }
+
+        let token = auth.create_session().unwrap();
+        let cookie = format!("theme=dark; {SESSION_COOKIE_NAME}={token}");
+        assert_eq!(get_body(app(&auth), CLIP, Some(&cookie), None).await, (StatusCode::OK, "clip".into()));
+        assert_eq!(get_body(app(&auth), "/memory", Some(&cookie), None).await, (StatusCode::OK, "memory".into()));
+    }
+
+    #[tokio::test]
+    async fn other_spellings_never_reach_the_media() {
+        let auth = auth("admin", "secret");
+        for path in ["//TeslaCam/x.mp4", "/%54eslaCam/x.mp4", "/teslacam/x.mp4", "/TeslaCam/../TeslaCam/x.mp4"] {
+            let (_, body) = get_body(app(&auth), path, None, None).await;
+            assert_ne!(body, "clip", "{path} reached the media without login");
+        }
+    }
+
+    #[tokio::test]
+    async fn loopback_and_disabled_login_pass() {
+        let auth_on = auth("admin", "secret");
+        assert_eq!(get_body(app(&auth_on), CLIP, None, Some("127.0.0.1:5000")).await.0, StatusCode::OK);
+        assert_eq!(get_body(app(&auth_on), CLIP, None, Some("[::ffff:127.0.0.1]:5000")).await.0, StatusCode::OK);
+        assert_eq!(get_body(app(&auth_on), CLIP, None, Some("192.168.4.2:5000")).await.0, StatusCode::UNAUTHORIZED);
+
+        // Partial credentials disable web login, as for the API.
+        for off in [auth("", ""), auth("admin", "")] {
+            assert_eq!(get_body(app(&off), CLIP, None, None).await, (StatusCode::OK, "clip".into()));
+        }
+    }
 }

@@ -302,8 +302,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/terminal", get(crate::terminal::handle_terminal))
         // WebSocket
         .route("/api/ws", get(ws_handler))
-        // Memory HTML page
-        .route("/memory", get(crate::memory::memory_page))
+        // Memory HTML page; outside /api, so it carries the web login gate itself.
+        .route(
+            "/memory",
+            get(crate::memory::memory_page).layer(axum::middleware::from_fn_with_state(
+                state.auth.clone(),
+                crate::auth::require_login,
+            )),
+        )
         // Paired-device cloud uploads and manual queue retry.
         .route("/api/cloud/status", get(crate::cloud::get_status))
         .route("/api/cloud/queue", get(crate::cloud::get_queue))

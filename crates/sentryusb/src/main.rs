@@ -388,15 +388,25 @@ async fn serve_with_common_layers(
     // at /var/www/html/TeslaCam. Modern browsers (Chrome 80+, Firefox 70+,
     // Safari iOS 13+, ExoPlayer) parse Tesla's `ctts` atom natively, so
     // no FUSE wrapper is needed.
+    // Both media mounts sit outside /api, so they carry the web login gate
+    // themselves.
     app = app.nest_service(
         "/TeslaCam",
-        tower_http::services::ServeDir::new("/var/www/html/TeslaCam"),
+        sentryusb_api::auth::login_gated(
+            auth.clone(),
+            axum::Router::new()
+                .fallback_service(tower_http::services::ServeDir::new("/var/www/html/TeslaCam")),
+        ),
     );
 
     // Serve /fs/ for music/lightshow/boombox autofs mounts
     app = app.nest_service(
         "/fs",
-        tower_http::services::ServeDir::new("/var/www/html/fs"),
+        sentryusb_api::auth::login_gated(
+            auth.clone(),
+            axum::Router::new()
+                .fallback_service(tower_http::services::ServeDir::new("/var/www/html/fs")),
+        ),
     );
 
     // Static file serving with SPA fallback (unless dev mode)
