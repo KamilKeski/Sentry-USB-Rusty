@@ -702,6 +702,17 @@ fn field_secs_ago(
 pub async fn ble_latest_sample(
     State(s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let sample = latest_car_sample(&s)
+        .await
+        .unwrap_or_else(|| serde_json::json!({ "ts": null }));
+    (StatusCode::OK, Json(sample))
+}
+
+/// The latest car sample exactly as GET /api/system/ble-latest-sample
+/// returns it (`{"ts": null}` when there is no car data), or None when it
+/// couldn't be built. The live_status push omits it then, so clients keep
+/// their last value; the endpoint answers `{"ts": null}` as it always has.
+pub(crate) async fn latest_car_sample(s: &AppState) -> Option<serde_json::Value> {
     let store = s.drives.store.clone();
     let floor = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -806,8 +817,7 @@ pub async fn ble_latest_sample(
             })
         }))
         })
-        .await
-        .flatten();
+        .await?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -846,9 +856,7 @@ pub async fn ble_latest_sample(
                         .map(|(hla, hlo, r)| distance_m(la, crate::normalize_lon(lo), hla, hlo) <= r)
                 })
                 .unwrap_or(false);
-            (
-            StatusCode::OK,
-            Json(serde_json::json!({
+            Some(serde_json::json!({
                 "ts": ts,
                 "seconds_ago": (now - ts).max(0),
                 "battery_pct": battery_pct.map(|(v, _)| v),
@@ -875,13 +883,9 @@ pub async fn ble_latest_sample(
                 // Body-controller age distinguishes Quiet mode from total failure.
                 "body_controller_seconds_ago": body_controller_ts
                     .map(|t| (now - t).max(0)),
-            })),
-        )
+            }))
         }
-        None => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "ts": null })),
-        ),
+        None => Some(serde_json::json!({ "ts": null })),
     }
 }
 
