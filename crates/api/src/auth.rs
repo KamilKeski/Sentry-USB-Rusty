@@ -245,6 +245,14 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
+    // Loopback is trusted for the Pi's own root services (archiveloop,
+    // notification scripts, keep-accessory, the auto-update coordinator).
+    // The one loopback client that forwards requests from someone else is
+    // the BLE bridge (server/ble/sentryusb-ble.py), so it MUST enforce this
+    // login itself: claiming over BLE requires these credentials when they
+    // are set, and an unclaimed Pi serves nothing. Anything new that relays
+    // remote requests to loopback (a tunnel, a reverse proxy) has to do the
+    // same or this bypass becomes an open door.
     if let Some(addr) = req.extensions().get::<axum::extract::ConnectInfo<std::net::SocketAddr>>() {
         // Canonicalize IPv4-mapped IPv6 on dual-stack listeners.
         if addr.ip().to_canonical().is_loopback() {

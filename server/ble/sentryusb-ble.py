@@ -17,7 +17,9 @@ import dbus
 import dbus.exceptions
 import dbus.mainloop.glib
 import dbus.service
+import hashlib
 import json
+import re
 import subprocess
 import os
 import sys
@@ -135,6 +137,16 @@ API_BASE = None
 
 PIN_FILE = '/root/.sentryusb/ble-pin'
 BOOT_PIN_FILE = '/boot/firmware/BLE_PIN'
+# Fingerprint of the web login the claim was made under; see
+# enforce_web_auth_binding. Kept beside PIN_FILE, never on /boot.
+PIN_BINDING_FILE = '/root/.sentryusb/ble-pin-web-auth'
+
+# Same search order as sentryusb_config::find_config_path.
+CONFIG_PATHS = (
+    '/root/sentryusb.conf',
+    '/boot/firmware/sentryusb.conf',
+    '/boot/sentryusb.conf',
+)
 
 # Track authenticated BLE peers (by D-Bus device path). Cleared per peer
 # on disconnect (see setup_connection_logging) so a session always
@@ -187,11 +199,38 @@ def load_pin():
         return None
 
 
-def save_pin(pin):
-    """Save a new BLE passcode."""
-    # Root filesystem is read-only at runtime — remount rw before writing.
+def remount_root_rw():
+    """Root filesystem is read-only at runtime — remount rw before writing."""
     subprocess.run(['/root/bin/remountfs_rw'], capture_output=True, timeout=5)
+
+
+def write_private_file(path, text):
+    """Atomically replace `path` with `text`, readable by root only."""
+    tmp = path + '.tmp'
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def save_pin_binding(creds):
+    salt = os.urandom(16)
+    write_private_file(PIN_BINDING_FILE, json.dumps({
+        'salt': salt.hex(),
+        'web_auth': web_auth_fingerprint(creds, salt),
+    }))
+
+
+def save_pin(pin, creds):
+    """Save a new BLE passcode, bound to the web login `creds` it was
+    claimed under."""
+    remount_root_rw()
     os.makedirs(os.path.dirname(PIN_FILE), exist_ok=True)
+    # Binding first: a crash between the two writes leaves the Pi
+    # unclaimed with a stale binding, which the next claim overwrites.
+    save_pin_binding(creds)
     with open(PIN_FILE, 'w') as f:
         f.write(pin)
     # Also write to boot partition for easy reset
@@ -203,8 +242,71 @@ def save_pin(pin):
     log.info(f'BLE passcode set (length={len(pin)})')
 
 
+def reset_claim(reason):
+    """Forget the BLE claim: the PIN, its binding, and every authenticated
+    peer. Claiming again needs the current web login."""
+    authenticated_peers.clear()
+    try:
+        remount_root_rw()
+    except Exception as e:
+        log.error(f'BLE claim reset: remount failed: {e}')
+    for path in (PIN_FILE, BOOT_PIN_FILE, PIN_BINDING_FILE):
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            log.error(f'BLE claim reset: could not remove {path}: {e}')
+    log.warning(f'BLE claim reset: {reason}')
+
+
+_legacy_binding_attempted = False
+
+
+def enforce_web_auth_binding():
+    """Reset the claim when the web login changed since it was made.
+
+    Runs on every claim/auth check, so the running daemon picks up a
+    credential change (web UI, setup wizard, or a hand edit of the config)
+    without a restart, and peers authenticated under the old login lose
+    access immediately. Enabling, changing or disabling the web login all
+    count as a change. An unreadable config leaves the claim alone: a
+    transient read error must not wipe the owner's pairing.
+    """
+    global _legacy_binding_attempted
+    if load_pin() is None:
+        return
+    creds = load_web_credentials()
+    if creds is None:
+        return
+    try:
+        with open(PIN_BINDING_FILE, 'r') as f:
+            binding = json.load(f)
+        salt = bytes.fromhex(binding['salt'])
+        stored = str(binding['web_auth'])
+    except FileNotFoundError:
+        # Claimed by a release that predates the binding. Adopt the
+        # current login rather than unpair every existing install; from
+        # here on, any change to it resets the claim.
+        if not _legacy_binding_attempted:
+            _legacy_binding_attempted = True
+            try:
+                remount_root_rw()
+                save_pin_binding(creds)
+                log.info('BLE claim bound to the current web login')
+            except Exception as e:
+                log.error(f'Could not bind existing BLE claim: {e}')
+        return
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        reset_claim(f'unreadable web login binding ({e})')
+        return
+    if not hmac.compare_digest(stored, web_auth_fingerprint(creds, salt)):
+        reset_claim('web login changed since the BLE claim')
+
+
 def is_claimed():
     """Check if a passcode has been set (device is claimed)."""
+    enforce_web_auth_binding()
     return load_pin() is not None
 
 
@@ -266,11 +368,17 @@ def clear_peer_auth(device):
 
 
 def is_authenticated(options):
-    """Check if the connected peer is authenticated."""
+    """Check if the connected peer is authenticated.
+
+    There is deliberately no pass-through for an unclaimed Pi: it serves
+    nothing over BLE until claimed. First-time setup doesn't need one —
+    the app claims with set_pin before any WiFi or API use, and set_pin
+    authenticates the claiming peer. A peer BlueZ doesn't identify (no
+    'device' option, which BlueZ >= 5.50 always sends) is never trusted.
+    """
     device = options.get('device', '')
-    if not device:
-        # If we can't determine the device, check if unclaimed (allow all)
-        return not is_claimed()
+    if not device or not is_claimed():
+        return False
     return str(device) in authenticated_peers
 
 
@@ -280,6 +388,112 @@ def mark_authenticated(options):
     if device:
         authenticated_peers.add(str(device))
         log.info(f'Peer authenticated: {device}')
+
+
+# ============================================================
+# Web login (WEB_USERNAME / WEB_PASSWORD)
+# ============================================================
+#
+# API requests are proxied to the web server over loopback, which the web
+# auth middleware trusts, so this daemon is the only gate between a BLE
+# peer and the API. When web login is enabled, claiming the Pi over BLE
+# must prove that login; the PIN then covers day-to-day reconnects.
+# Parsing mirrors sentryusb_config (parse_file/unquote) and the enabled
+# rule mirrors AuthState::auth_required, so both sides agree.
+
+_CONFIG_KEY_RE = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
+
+
+def find_config_path():
+    override = os.environ.get('SENTRYUSB_CONFIG_PATH')
+    if override:
+        return override
+    for path in CONFIG_PATHS:
+        if os.path.exists(path):
+            return path
+    return CONFIG_PATHS[0]
+
+
+def unquote_config_value(value):
+    """Mirror of sentryusb_config's unquote."""
+    s = value.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        return s[1:-1]
+    if s.startswith("$'") and s.endswith("'") and len(s) >= 3:
+        return s[2:-1]
+    for i in range(1, len(s)):
+        if s[i] == '#' and s[i - 1] in (' ', '\t'):
+            return s[:i - 1].strip()
+    return s
+
+
+def parse_config_exports(text):
+    """Active `export KEY=VALUE` lines, as sentryusb_config::parse_file."""
+    active = {}
+    for line in text.split('\n'):
+        if line.endswith('\r'):
+            line = line[:-1]
+        rest = line.lstrip()
+        if not rest.startswith('export '):
+            continue
+        key, sep, raw = rest[len('export '):].partition('=')
+        if sep and _CONFIG_KEY_RE.match(key):
+            active[key] = unquote_config_value(raw)
+    return active
+
+
+_web_creds_cache = (None, None)
+
+
+def load_web_credentials():
+    """(username, password) from the active config.
+
+    ('', '') when there is no config file, which the web server also
+    treats as web login off. None when the file exists but can't be read:
+    callers must fail closed rather than treat that as login off.
+    """
+    global _web_creds_cache
+    path = find_config_path()
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return ('', '')
+    except OSError:
+        return None
+    key = (path, st.st_ino, st.st_mtime_ns, st.st_size)
+    if _web_creds_cache[0] == key:
+        return _web_creds_cache[1]
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            active = parse_config_exports(f.read())
+    except (OSError, UnicodeDecodeError):
+        return None
+    creds = (active.get('WEB_USERNAME', ''), active.get('WEB_PASSWORD', ''))
+    _web_creds_cache = (key, creds)
+    return creds
+
+
+def web_auth_required(creds):
+    """Partial credentials can't log anyone in, so both must be set."""
+    return bool(creds[0]) and bool(creds[1])
+
+
+def check_web_credentials(creds, username, password):
+    """Constant-time check of a web login against `creds`. Hashing first
+    keeps the comparison from leaking the stored lengths."""
+    def digest(s):
+        return hashlib.sha256(s.encode('utf-8')).digest()
+    user_ok = hmac.compare_digest(digest(username), digest(creds[0]))
+    pass_ok = hmac.compare_digest(digest(password), digest(creds[1]))
+    return user_ok and pass_ok
+
+
+def web_auth_fingerprint(creds, salt):
+    """What a claim is bound to: 'off', or a salted HMAC of the login."""
+    if not web_auth_required(creds):
+        return 'off'
+    login = creds[0].encode('utf-8') + b'\0' + creds[1].encode('utf-8')
+    return hmac.new(salt, login, hashlib.sha256).hexdigest()
 
 
 # ============================================================
@@ -991,8 +1205,10 @@ class DeviceInfoCharacteristic(Characteristic):
 
 
 class AuthCharacteristic(Characteristic):
-    """BLE authentication. Read returns {claimed, authenticated}.
-    Write accepts {action: 'set_pin'|'authenticate', pin: '...'}."""
+    """BLE authentication. Read returns {claimed, authenticated,
+    web_auth_required}. Write accepts {action: 'set_pin'|'authenticate',
+    pin: '...'}; set_pin also needs {username, password} (the web login)
+    when web_auth_required."""
 
     def __init__(self, bus, index, service):
         Characteristic.__init__(self, bus, index, AUTH_UUID,
@@ -1000,11 +1216,13 @@ class AuthCharacteristic(Characteristic):
         self.write_buffer = bytearray()
 
     def ReadValue(self, options):
-        device = options.get('device', '')
-        authed = str(device) in authenticated_peers if device else not is_claimed()
+        creds = load_web_credentials()
         info = {
             'claimed': is_claimed(),
-            'authenticated': authed,
+            'authenticated': is_authenticated(options),
+            # An unreadable config reads as required: the app asks for the
+            # login, and set_pin then fails closed on the Pi.
+            'web_auth_required': creds is None or web_auth_required(creds),
         }
         data = json.dumps(info).encode()
         return dbus.Array([dbus.Byte(b) for b in data], signature='y')
@@ -1024,19 +1242,20 @@ class AuthCharacteristic(Characteristic):
         pin = msg.get('pin', '')
 
         if action == 'set_pin':
+            device = str(options.get('device', ''))
             if is_claimed():
                 result = {'success': False, 'error': 'already_claimed'}
                 log.warning('set_pin rejected: device already claimed')
-            elif len(pin) < 4 or len(pin) > 6:
+            elif not device:
+                # Can't rate-limit or authenticate a peer BlueZ didn't name.
+                result = {'success': False, 'error': 'unknown_peer'}
+            elif auth_rate_limited(device):
+                result = {'success': False, 'error': 'too_many_attempts'}
+                log.warning(f'set_pin blocked: too many attempts from {device}')
+            elif not isinstance(pin, str) or len(pin) < 4 or len(pin) > 6:
                 result = {'success': False, 'error': 'pin_must_be_4_to_6_digits'}
             else:
-                try:
-                    save_pin(pin)
-                    mark_authenticated(options)
-                    result = {'success': True}
-                except Exception as e:
-                    log.error(f'Failed to save PIN: {e}')
-                    result = {'success': False, 'error': 'save_failed'}
+                result = self.claim(pin, msg, device, options)
         elif action == 'authenticate':
             device = options.get('device', '')
             if not is_claimed():
@@ -1057,6 +1276,33 @@ class AuthCharacteristic(Characteristic):
         data = json.dumps(result).encode()
         self.send_notification(
             dbus.Array([dbus.Byte(b) for b in data], signature='y'))
+
+    def claim(self, pin, msg, device, options):
+        """Claim an unclaimed Pi. With web login enabled the claimer must
+        prove it, since BLE API requests skip the web server's own login
+        check. Wrong logins count toward the same per-peer lockout as
+        wrong PINs."""
+        creds = load_web_credentials()
+        if creds is None:
+            log.warning('set_pin rejected: config unreadable')
+            return {'success': False, 'error': 'web_login_unavailable'}
+        if web_auth_required(creds):
+            username = msg.get('username')
+            password = msg.get('password')
+            if not (isinstance(username, str) and isinstance(password, str)
+                    and username and password):
+                return {'success': False, 'error': 'web_login_required'}
+            if not check_web_credentials(creds, username, password):
+                record_auth_failure(device)
+                log.warning('set_pin rejected: wrong web login')
+                return {'success': False, 'error': 'wrong_web_login'}
+        try:
+            save_pin(pin, creds)
+            mark_authenticated(options)
+            return {'success': True}
+        except Exception as e:
+            log.error(f'Failed to save PIN: {e}')
+            return {'success': False, 'error': 'save_failed'}
 
 
 # ============================================================

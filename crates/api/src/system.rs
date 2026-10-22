@@ -277,6 +277,12 @@ pub async fn ble_reset_pair(State(_s): State<AppState>) -> (StatusCode, Json<ser
             Err(e) => tracing::warn!("ble-reset: failed to remove {p}: {e}"),
         }
     }
+    // The claim's web-login binding goes with it (the next claim rewrites it).
+    if let Err(e) = std::fs::remove_file("/root/.sentryusb/ble-pin-web-auth") {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!("ble-reset: failed to remove web login binding: {e}");
+        }
+    }
 
     // Restart only the phone-facing GATT server.
     let restarted = sentryusb_shell::run_with_timeout(
