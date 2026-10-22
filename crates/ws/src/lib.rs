@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use serde::Serialize;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, Notify};
 use tracing::{debug, warn};
 
 /// A broadcast message sent to all connected WebSocket clients.
@@ -21,6 +21,7 @@ pub struct Message {
 pub struct Hub {
     tx: broadcast::Sender<Vec<u8>>,
     client_count: Arc<AtomicUsize>,
+    connected: Arc<Notify>,
 }
 
 impl Hub {
@@ -30,7 +31,19 @@ impl Hub {
         Hub {
             tx,
             client_count: Arc::new(AtomicUsize::new(0)),
+            connected: Arc::new(Notify::new()),
         }
+    }
+
+    /// True while at least one client is subscribed.
+    pub fn has_clients(&self) -> bool {
+        self.tx.receiver_count() > 0
+    }
+
+    /// Resolves after a client subscribes, so publishers can greet it with
+    /// current state. A connect with no one waiting is remembered once.
+    pub async fn client_connected(&self) {
+        self.connected.notified().await;
     }
 
     /// Broadcasts a typed message to all connected clients.
@@ -70,7 +83,10 @@ impl Hub {
         self.client_count.fetch_add(1, Ordering::Relaxed);
         let count = self.client_count.load(Ordering::Relaxed);
         debug!("WebSocket client connected ({} total)", count);
-        self.tx.subscribe()
+        let rx = self.tx.subscribe();
+        // After subscribing, so a greeting broadcast reaches this client.
+        self.connected.notify_one();
+        rx
     }
 
     /// Called when a client disconnects to track the count.
@@ -83,5 +99,32 @@ impl Hub {
 impl Default for Hub {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Hub;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn a_connecting_client_wakes_publishers_and_gets_the_greeting() {
+        let hub = Hub::new();
+        assert!(!hub.has_clients());
+
+        let mut rx = hub.subscribe();
+        assert!(hub.has_clients());
+        // The connect was remembered even though nobody was waiting yet.
+        tokio::time::timeout(Duration::from_secs(1), hub.client_connected())
+            .await
+            .expect("connect notification");
+
+        hub.broadcast("live_status", serde_json::json!({"status": {}, "drive": {}}));
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg, br#"{"type":"live_status","data":{"drive":{},"status":{}}}"#);
+
+        drop(rx);
+        hub.client_disconnected();
+        assert!(!hub.has_clients());
     }
 }

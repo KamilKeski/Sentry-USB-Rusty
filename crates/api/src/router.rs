@@ -37,6 +37,7 @@ impl axum::extract::FromRef<AppState> for sentryusb_ws::Hub {
 /// Build the complete Axum router with all API routes.
 pub fn build_router(state: AppState) -> Router {
     crate::status::start_network_sampler(state.net_sampler.clone());
+    crate::live_status::spawn(state.clone());
     let api = Router::new()
         // Status & config
         .route("/api/health", get(crate::status::liveness))
