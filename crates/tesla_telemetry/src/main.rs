@@ -998,6 +998,10 @@ async fn tick(
                                 refresh.tire_fr_psi = t.tire_fr_psi;
                                 refresh.tire_rl_psi = t.tire_rl_psi;
                                 refresh.tire_rr_psi = t.tire_rr_psi;
+                                refresh.tire_fl_seen_ts = t.tire_fl_seen_ts;
+                                refresh.tire_fr_seen_ts = t.tire_fr_seen_ts;
+                                refresh.tire_rl_seen_ts = t.tire_rl_seen_ts;
+                                refresh.tire_rr_seen_ts = t.tire_rr_seen_ts;
                                 any_ok = true;
                             }
                             Err(e) => warn!("parked-awake tires refresh failed: {e:#}"),
@@ -1301,6 +1305,10 @@ async fn tick(
                     sample.tire_fr_psi = t.tire_fr_psi;
                     sample.tire_rl_psi = t.tire_rl_psi;
                     sample.tire_rr_psi = t.tire_rr_psi;
+                    sample.tire_fl_seen_ts = t.tire_fl_seen_ts;
+                    sample.tire_fr_seen_ts = t.tire_fr_seen_ts;
+                    sample.tire_rl_seen_ts = t.tire_rl_seen_ts;
+                    sample.tire_rr_seen_ts = t.tire_rr_seen_ts;
                     true
                 }
                 Err(e) => {

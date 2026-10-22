@@ -629,10 +629,10 @@ type LatestSample = (
     Option<(f64, i64)>,   // interior_temp_c + ts
     Option<(f64, i64)>,   // exterior_temp_c + ts
     Option<i64>,          // hvac_on
-    Option<(f64, i64)>,   // tire_fl_psi + ts
-    Option<(f64, i64)>,   // tire_fr_psi + ts
-    Option<(f64, i64)>,   // tire_rl_psi + ts
-    Option<(f64, i64)>,   // tire_rr_psi + ts
+    Option<(f64, i64)>,   // tire_fl_psi + when the car last heard the sensor
+    Option<(f64, i64)>,   // tire_fr_psi + same
+    Option<(f64, i64)>,   // tire_rl_psi + same
+    Option<(f64, i64)>,   // tire_rr_psi + same
     Option<f64>,          // odometer_mi
     Option<String>,       // location_name
     // Coordinates remain internal; derive at_home against the current geofence.
@@ -645,9 +645,28 @@ type LatestSample = (
 static LATEST_SAMPLE_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), Option<LatestSample>> =
     crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(10));
 
+/// A tire's latest pressure and the time it was measured. Parked, TPMS
+/// sensors sleep and the car keeps reporting the last pressure it heard, so
+/// the time is the car's own "last seen" time for that sensor; the poll time
+/// stands in when the car didn't send one (and for rows from before v23).
+fn latest_tire(conn: &rusqlite::Connection, tire: &str, floor: i64) -> Option<(f64, i64)> {
+    conn.query_row(
+        &format!(
+            "SELECT tire_{tire}_psi, COALESCE(tire_{tire}_seen_ts, ts) \
+             FROM telemetry_samples \
+             WHERE tire_{tire}_psi IS NOT NULL AND ts >= ?1 \
+             ORDER BY ts DESC LIMIT 1"
+        ),
+        (floor,),
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .ok()
+}
+
 /// Volatile dashboard-field ages in seconds, independent of the
-/// sample-envelope age. `tires` is front-left's age, kept for the web UI and
-/// older apps; `tire_fl`..`tire_rr` give each tire its own.
+/// sample-envelope age. Tire ages count from when the car last heard each
+/// sensor. `tires` is front-left's age, kept for the web UI and older apps;
+/// `tire_fl`..`tire_rr` give each tire its own.
 fn field_secs_ago(
     now: i64,
     [battery_pct, interior_temp_c, exterior_temp_c]: [&Option<(f64, i64)>; 3],
@@ -760,11 +779,10 @@ pub async fn ble_latest_sample(
                     latest_col_f64_aged("interior_temp_c"),
                     latest_col_f64_aged("exterior_temp_c"),
                     latest_col_i64("hvac_on"),
-                    // Each tire keeps its own timestamp: a sensor can miss polls.
-                    latest_col_f64_aged("tire_fl_psi"),
-                    latest_col_f64_aged("tire_fr_psi"),
-                    latest_col_f64_aged("tire_rl_psi"),
-                    latest_col_f64_aged("tire_rr_psi"),
+                    latest_tire(conn, "fl", floor),
+                    latest_tire(conn, "fr", floor),
+                    latest_tire(conn, "rl", floor),
+                    latest_tire(conn, "rr", floor),
                     latest_col_f64("odometer_mi"),
                     latest_col_string("location_name"),
                     latest_col_f64("latitude"),
@@ -1086,6 +1104,35 @@ mod tests {
         )
         .unwrap();
         assert_eq!(authenticated_activity(&conn, 900), (100, 0));
+    }
+
+    #[test]
+    fn tire_time_is_when_the_car_last_heard_the_sensor() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        sentryusb_drives::schema::migrate(&conn).unwrap();
+        // Poll at 10_000: FL's sensor last reported two hours earlier, FR's
+        // time is unknown, RL only has an older pre-v23 reading.
+        conn.execute_batch(
+            "INSERT INTO telemetry_samples (ts, source, tire_rl_psi) VALUES (2000, 'state', 39.0);
+             INSERT INTO telemetry_samples (ts, source, tire_fl_psi, tire_fr_psi, tire_fl_seen_ts)
+                 VALUES (10000, 'state', 41.0, 40.5, 2800);",
+        )
+        .unwrap();
+        assert_eq!(latest_tire(&conn, "fl", 0), Some((41.0, 2800)));
+        assert_eq!(latest_tire(&conn, "fr", 0), Some((40.5, 10_000)));
+        assert_eq!(latest_tire(&conn, "rl", 0), Some((39.0, 2000)));
+        assert_eq!(latest_tire(&conn, "rr", 0), None);
+        // The lookback window still applies to the poll time.
+        assert_eq!(latest_tire(&conn, "rl", 5000), None);
+
+        let ages = field_secs_ago(
+            10_000,
+            [&None, &None, &None],
+            [&latest_tire(&conn, "fl", 0), &latest_tire(&conn, "fr", 0), &None, &None],
+        );
+        assert_eq!(ages["tire_fl"], 7200);
+        assert_eq!(ages["tires"], 7200);
+        assert_eq!(ages["tire_fr"], 0);
     }
 
     #[test]

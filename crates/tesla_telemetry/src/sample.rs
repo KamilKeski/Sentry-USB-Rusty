@@ -274,6 +274,12 @@ pub struct TiresResult {
     pub tire_fr_psi: Option<f64>,
     pub tire_rl_psi: Option<f64>,
     pub tire_rr_psi: Option<f64>,
+    /// When the car last heard from each tire's sensor (unix seconds).
+    /// Parked, the sensors sleep and the pressures above go stale.
+    pub tire_fl_seen_ts: Option<i64>,
+    pub tire_fr_seen_ts: Option<i64>,
+    pub tire_rl_seen_ts: Option<i64>,
+    pub tire_rr_seen_ts: Option<i64>,
     pub meta: ResponseMeta,
 }
 
@@ -314,6 +320,11 @@ pub struct Sample {
     pub tire_fr_psi: Option<f64>,
     pub tire_rl_psi: Option<f64>,
     pub tire_rr_psi: Option<f64>,
+    /// Car-reported time each tire's sensor last reported (unix seconds).
+    pub tire_fl_seen_ts: Option<i64>,
+    pub tire_fr_seen_ts: Option<i64>,
+    pub tire_rl_seen_ts: Option<i64>,
+    pub tire_rr_seen_ts: Option<i64>,
     /// Odometer in miles (Tesla native unit). Sampled every awake
     /// cycle — ticks continuously while driving.
     pub odometer_mi: Option<f64>,

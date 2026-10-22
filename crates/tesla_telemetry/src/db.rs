@@ -39,10 +39,11 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
           charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, battery_range_mi, \
           charging_amps_set, charge_current_request_max, charge_port_door_open, \
           latitude, longitude, \
-          source, charge_minutes_to_full, charging_state) \
+          source, charge_minutes_to_full, charging_state, \
+          tire_fl_seen_ts, tire_fr_seen_ts, tire_rl_seen_ts, tire_rr_seen_ts) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
                  ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, \
-                 ?25, ?26, ?27) \
+                 ?25, ?26, ?27, ?28, ?29, ?30, ?31) \
          ON CONFLICT(ts) DO UPDATE SET \
            battery_pct                = COALESCE(excluded.battery_pct, battery_pct), \
            battery_temp_c             = COALESCE(excluded.battery_temp_c, battery_temp_c), \
@@ -70,7 +71,11 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
            source                     = CASE WHEN excluded.source = 'state' OR source = 'state' \
                                              THEN 'state' ELSE excluded.source END, \
            charge_minutes_to_full     = COALESCE(excluded.charge_minutes_to_full, charge_minutes_to_full), \
-           charging_state             = COALESCE(excluded.charging_state, charging_state)",
+           charging_state             = COALESCE(excluded.charging_state, charging_state), \
+           tire_fl_seen_ts            = COALESCE(excluded.tire_fl_seen_ts, tire_fl_seen_ts), \
+           tire_fr_seen_ts            = COALESCE(excluded.tire_fr_seen_ts, tire_fr_seen_ts), \
+           tire_rl_seen_ts            = COALESCE(excluded.tire_rl_seen_ts, tire_rl_seen_ts), \
+           tire_rr_seen_ts            = COALESCE(excluded.tire_rr_seen_ts, tire_rr_seen_ts)",
         params![
             s.ts,
             s.battery_pct,
@@ -99,6 +104,10 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
             s.source,
             s.charge_minutes_to_full,
             s.charging_state,
+            s.tire_fl_seen_ts,
+            s.tire_fr_seen_ts,
+            s.tire_rl_seen_ts,
+            s.tire_rr_seen_ts,
         ],
     )?;
     Ok(())
@@ -140,6 +149,31 @@ mod tests {
             .query_row("SELECT count(*) FROM telemetry_samples", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn insert_keeps_the_cars_tire_last_seen_times() {
+        let conn = fresh_memory_db();
+        let tires = Sample {
+            ts: 1_700_000_200,
+            tire_fl_psi: Some(41.0),
+            tire_fl_seen_ts: Some(1_699_993_000),
+            tire_rr_psi: Some(40.0),
+            source: "state".into(),
+            ..Sample::default()
+        };
+        insert(&conn, &tires).unwrap();
+        // A same-second sample without tire data must not erase them.
+        insert(&conn, &Sample { ts: tires.ts, battery_pct: Some(80.0), source: "state".into(), ..Sample::default() }).unwrap();
+
+        let seen: (Option<i64>, Option<i64>) = conn
+            .query_row(
+                "SELECT tire_fl_seen_ts, tire_rr_seen_ts FROM telemetry_samples WHERE ts = ?1",
+                [tires.ts],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(seen, (Some(1_699_993_000), None));
     }
 
     #[test]

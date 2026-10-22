@@ -131,7 +131,11 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// v21 -> v22: persist the observable Tesla v2.2 estimate's measured-IMU
 /// coverage, per-sample late-night time, generic AP boundary mode, and compact
 /// five-second grace prefix. All columns are nullable for restart-safe upgrade.
-pub const CURRENT_SCHEMA_VERSION: i32 = 22;
+/// v22 -> v23: store when the car last heard from each tire's TPMS sensor
+/// (V23_TELEMETRY_TPMS_SEEN_COLUMNS). Parked, the sensors sleep and the car
+/// keeps reporting the old pressure, so the poll time overstates freshness.
+/// Nullable; rows from before v23 (or cars that omit the time) stay NULL.
+pub const CURRENT_SCHEMA_VERSION: i32 = 23;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly â€”
@@ -424,6 +428,14 @@ pub const V17_TELEMETRY_CHARGING_CONTROL_COLUMNS: &[(&str, &str)] = &[
     ("charging_amps_set", "INTEGER"),
     ("charge_current_request_max", "INTEGER"),
     ("charge_port_door_open", "INTEGER"),
+];
+
+/// v23 per-tire TPMS "last seen" times, unix seconds as reported by the car.
+pub const V23_TELEMETRY_TPMS_SEEN_COLUMNS: &[(&str, &str)] = &[
+    ("tire_fl_seen_ts", "INTEGER"),
+    ("tire_fr_seen_ts", "INTEGER"),
+    ("tire_rl_seen_ts", "INTEGER"),
+    ("tire_rr_seen_ts", "INTEGER"),
 ];
 
 /// v10 per-clip location-name rollups on `routes`. Populated by
@@ -844,6 +856,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V13_TELEMETRY_MINUTES_COLUMN.iter())
         .chain(V14_TELEMETRY_CHARGE_PHASE_COLUMN.iter())
         .chain(V17_TELEMETRY_CHARGING_CONTROL_COLUMNS.iter())
+        .chain(V23_TELEMETRY_TPMS_SEEN_COLUMNS.iter())
     {
         if existing_tele.contains(*name) {
             continue;
@@ -1053,7 +1066,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22"),
+            Some("23"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -1091,7 +1104,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1123,7 +1136,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1157,7 +1170,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1264,7 +1277,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1315,7 +1328,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1368,7 +1381,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1405,7 +1418,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1443,7 +1456,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1465,7 +1478,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1538,7 +1551,7 @@ mod tests {
         assert_eq!(retained, (73.0, None, None, None));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1577,7 +1590,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1617,7 +1630,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1658,7 +1671,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1718,7 +1731,7 @@ mod tests {
         assert!(ap.is_none(), "pre-v21 rows read as absent, not empty");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 
@@ -1775,7 +1788,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retained, (1214, None, None));
-        assert_eq!(meta_get(&conn, "schema_version").unwrap().as_deref(), Some("22"));
+        assert_eq!(meta_get(&conn, "schema_version").unwrap().as_deref(), Some("23"));
+    }
+
+    #[test]
+    fn migrate_from_v22_adds_v23_tire_seen_columns_keeping_readings() {
+        let conn = open();
+        migrate(&conn).unwrap();
+        for (name, _) in V23_TELEMETRY_TPMS_SEEN_COLUMNS {
+            conn.execute(&format!("ALTER TABLE telemetry_samples DROP COLUMN {name}"), [])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO telemetry_samples(ts, source, tire_fl_psi) VALUES(1700000000, 'state', 41.0)",
+            [],
+        )
+        .unwrap();
+        meta_set(&conn, "schema_version", "22").unwrap();
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let cols = list_telemetry_columns(&conn).unwrap();
+        for (name, _) in V23_TELEMETRY_TPMS_SEEN_COLUMNS {
+            assert!(cols.contains(*name), "telemetry_samples.{name} missing after v23");
+        }
+        let retained: (f64, Option<i64>) = conn
+            .query_row("SELECT tire_fl_psi, tire_fl_seen_ts FROM telemetry_samples", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(retained, (41.0, None));
+        assert_eq!(meta_get(&conn, "schema_version").unwrap().as_deref(), Some("23"));
     }
 
     #[test]
@@ -1817,7 +1861,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("22")
+            Some("23")
         );
     }
 

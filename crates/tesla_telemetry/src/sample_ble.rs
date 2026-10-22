@@ -583,8 +583,18 @@ pub async fn sample_tires_ble(session: &PersistentSession) -> Result<TiresResult
         tire_fr_psi: fr,
         tire_rl_psi: rl,
         tire_rr_psi: rr,
+        tire_fl_seen_ts: seen_secs(tires.tpms_last_seen_pressure_time_fl.as_ref()),
+        tire_fr_seen_ts: seen_secs(tires.tpms_last_seen_pressure_time_fr.as_ref()),
+        tire_rl_seen_ts: seen_secs(tires.tpms_last_seen_pressure_time_rl.as_ref()),
+        tire_rr_seen_ts: seen_secs(tires.tpms_last_seen_pressure_time_rr.as_ref()),
         meta,
     })
+}
+
+/// A TPMS "last seen" time in unix seconds. An unset (zero) timestamp
+/// means the car didn't say, which callers treat as unknown.
+fn seen_secs(ts: Option<&prost_types::Timestamp>) -> Option<i64> {
+    ts.map(|t| t.seconds).filter(|&secs| secs > 0)
 }
 
 /// `body-controller-state` over BLE. Unauthenticated — works against a
@@ -685,5 +695,18 @@ fn short_vin(vin: &str) -> String {
         format!("{}...{}", &vin[..3], &vin[vin.len() - 4..])
     } else {
         vin.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::seen_secs;
+
+    #[test]
+    fn unset_tire_last_seen_time_is_unknown() {
+        let at = |seconds| prost_types::Timestamp { seconds, nanos: 0 };
+        assert_eq!(seen_secs(Some(&at(1_699_993_000))), Some(1_699_993_000));
+        assert_eq!(seen_secs(Some(&at(0))), None);
+        assert_eq!(seen_secs(None), None);
     }
 }
