@@ -43,10 +43,14 @@ pub async fn configure_hostname(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
 
 const AVAHI_DAEMON_CONF: &str = "/etc/avahi/avahi-daemon.conf";
 
-/// Advertise IPv4-only mDNS to avoid stale SLAAC addresses and browser PNA blocks.
+/// Avahi daemon settings, mirrored by setup/pi/avahi-ipv4-only.sh.
+/// IPv4-only mDNS avoids stale SLAAC addresses and browser PNA blocks.
+/// No workstation record keeps answers within a 512-byte legacy-unicast
+/// packet; otherwise avahi drops records, the A record included.
 const AVAHI_IPV4_ONLY: &[(&str, &str, &str)] = &[
     ("server", "use-ipv6", "no"),
     ("publish", "publish-aaaa-on-ipv4", "no"),
+    ("publish", "publish-workstation", "no"),
 ];
 
 /// Sets one INI key in its named section, deduplicating only within that section.
@@ -680,6 +684,19 @@ mod set_ini_key_tests {
         let (out, changed) = set_ini_key(STOCK, "server", "use-ipv6", "no");
         assert!(changed);
         assert_eq!(out, "[server]\nuse-ipv6=no\nuse-ipv4=yes\n\n[publish]\n#publish-aaaa-on-ipv4=yes\n");
+    }
+
+    #[test]
+    fn avahi_settings_turn_off_the_workstation_record() {
+        let stock = "[server]\nuse-ipv4=yes\n\n[publish]\n#publish-workstation=yes\npublish-hinfo=no\n";
+        let mut conf = stock.to_string();
+        for (section, key, value) in super::AVAHI_IPV4_ONLY {
+            conf = set_ini_key(&conf, section, key, value).0;
+        }
+        assert_eq!(
+            conf,
+            "[server]\nuse-ipv4=yes\nuse-ipv6=no\n\n[publish]\npublish-workstation=no\npublish-hinfo=no\npublish-aaaa-on-ipv4=no\n"
+        );
     }
 
     #[test]

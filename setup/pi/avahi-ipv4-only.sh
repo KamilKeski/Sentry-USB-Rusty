@@ -12,6 +12,12 @@
 # both. Kernel/socket IPv6 on the device is untouched — this only changes
 # what mDNS hands out.
 #
+# It also turns off avahi's default "workstation" record. Answers to
+# legacy-unicast queries must fit one 512-byte packet; with that record
+# avahi overflows and drops the rest, including the A record, so some
+# clients can't resolve <hostname>.local. Keep in sync with
+# AVAHI_IPV4_ONLY in crates/setup/src/system.rs.
+#
 # Edits are section-aware (a use-ipv6 line under [publish] can keep avahi
 # from starting), dedupe repeated assignments, and append the section when
 # missing. Idempotent: prints "changed" or "unchanged" on stdout so callers
@@ -89,6 +95,7 @@ set_key() {
 
 set_key server use-ipv6 no
 set_key publish publish-aaaa-on-ipv4 no
+set_key publish publish-workstation no
 
 if [ "$CHANGED" = 1 ]; then
   echo "changed"

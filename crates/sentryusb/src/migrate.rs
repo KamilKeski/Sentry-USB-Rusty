@@ -331,19 +331,34 @@ if [ -f "$TMPDIR/setup/pi/avahi-sentryusb.service" ]; then
     # the last 4 characters of /etc/machine-id, uppercased.
     _machine_id=$(tr -d '[:space:]' < /etc/machine-id 2>/dev/null || true)
     _avahi_suffix=$(printf '%s' "$_machine_id" | tail -c 4 | tr '[:lower:]' '[:upper:]')
+    # Restart avahi only when the service file or daemon config changed.
+    _avahi_changed=0
+    _avahi_service=/etc/avahi/services/sentryusb.service
     sed "s/@DEVICE_SUFFIX@/${{_avahi_suffix:-0000}}/" "$TMPDIR/setup/pi/avahi-sentryusb.service" \
-      > /etc/avahi/services/sentryusb.service
+      > "$_avahi_service.new"
+    if cmp -s "$_avahi_service.new" "$_avahi_service"; then
+      rm -f "$_avahi_service.new"
+    else
+      mv -f "$_avahi_service.new" "$_avahi_service"
+      _avahi_changed=1
+    fi
     # IPv4-only mDNS advertising (stale-AAAA slowness + Chrome PNA "CORS"
-    # blocks on http://sentryusb.local — see the helper's header comment).
+    # blocks on http://sentryusb.local) and no workstation record (keeps
+    # legacy-unicast answers in one packet) — see the helper's header.
     # Nonfatal, but loud: the setup repair path is the self-heal backstop.
     if [ -f "$TMPDIR/setup/pi/avahi-ipv4-only.sh" ]; then
-      bash "$TMPDIR/setup/pi/avahi-ipv4-only.sh" \
-        || echo "migrate WARNING: could not apply IPv4-only avahi config" >&2
+      if _avahi_conf=$(bash "$TMPDIR/setup/pi/avahi-ipv4-only.sh"); then
+        if [ "$_avahi_conf" = changed ]; then _avahi_changed=1; fi
+      else
+        echo "migrate WARNING: could not apply avahi daemon config" >&2
+      fi
     else
       echo "migrate WARNING: avahi-ipv4-only.sh missing from update payload" >&2
     fi
     systemctl enable avahi-daemon 2>/dev/null || true
-    systemctl restart avahi-daemon 2>/dev/null || true
+    if [ "$_avahi_changed" = 1 ] || ! systemctl -q is-active avahi-daemon; then
+      systemctl restart avahi-daemon 2>/dev/null || true
+    fi
   fi
 fi
 
