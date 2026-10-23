@@ -16,6 +16,8 @@ rusqlite = { version = "0.40", features = ["bundled"] }
 base64 = "0.23"
 
 sentryusb-ws = { path = "../ws", package = "sentryusb-ws" }
+# Cloud clip ids in drive summaries use the uploader's own rule.
+sentryusb-cloud-crypto = { path = "../cloud_crypto", package = "sentryusb-cloud-crypto" }
 
 [dev-dependencies]
 tempfile = "3"

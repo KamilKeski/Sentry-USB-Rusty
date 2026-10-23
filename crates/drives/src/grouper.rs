@@ -459,6 +459,8 @@ pub fn find_drive_files(summaries:&[RouteSummary],id:&str)->Option<(usize,Vec<St
 pub struct DriveSelection {
     pub index: usize,
     pub files: Vec<String>,
+    /// Sentry Cloud id of each of `files`, in the same order.
+    pub clip_ids: Vec<String>,
     pub clip_spans_ms: HashMap<String,i64>,
     pub summary: DriveSummary,
 }
@@ -468,13 +470,14 @@ pub fn resolve_drive_selection(summaries: &[RouteSummary], id: &str,
     let groups=group_summary_clips(summaries);
     let index=resolve_group_index(summaries,&groups,id,false)?;
     let clips=&groups[index];
-    let mut files=Vec::new();let mut clip_spans_ms=HashMap::new();
+    let mut files=Vec::new();let mut clip_ids=Vec::new();let mut clip_spans_ms=HashMap::new();
     for clip in clips {
         if clip_spans_ms.insert(clip.summary.file.clone(),clip.clip_span_ms).is_none() {
             files.push(clip.summary.file.clone());
+            clip_ids.push(clip.summary.cloud_clip_id());
         }
     }
-    Some(DriveSelection {index,files,clip_spans_ms,summary:build_summary_from_aggregates(clips,index,tags)})
+    Some(DriveSelection {index,files,clip_ids,clip_spans_ms,summary:build_summary_from_aggregates(clips,index,tags)})
 }
 
 /// Drive membership from one grouping pass, owned so it can be cached per
@@ -613,15 +616,18 @@ impl DriveIndex {
             })
             .collect::<Option<Vec<_>>>()?;
         let mut files = Vec::new();
+        let mut clip_ids = Vec::new();
         let mut clip_spans_ms = HashMap::new();
         for clip in &clips {
             if clip_spans_ms.insert(clip.summary.file.clone(), clip.clip_span_ms).is_none() {
                 files.push(clip.summary.file.clone());
+                clip_ids.push(clip.summary.cloud_clip_id());
             }
         }
         Some(DriveSelection {
             index,
             files,
+            clip_ids,
             clip_spans_ms,
             summary: build_summary_from_aggregates(&clips, index, tags),
         })
@@ -3236,6 +3242,7 @@ fn build_drive_stats(
         avg_speed_kmh: round2(avg_speed_mps * 3.6),
         max_speed_kmh: round2(max_speed_mps * 3.6),
         clip_count: clips.len(),
+        clip_ids: Vec::new(),
         point_count: all_points.len(),
         points: point_data,
         gear_states: gear_state_result,
@@ -5352,6 +5359,7 @@ mod tests {
             source: None,
             external_signature: None,
             telemetry: Default::default(),
+            cloud_route_id: None,
         };
         let s2 = RouteSummary {
             file: "/cam/2025-01-15_12-01-00-front.mp4".to_string(),
@@ -5365,6 +5373,7 @@ mod tests {
             source: None,
             external_signature: None,
             telemetry: Default::default(),
+            cloud_route_id: None,
         };
 
         let ts = chrono::NaiveDateTime::parse_from_str("2025-01-15T12:00:00", "%Y-%m-%dT%H:%M:%S")
@@ -5398,6 +5407,7 @@ mod tests {
             source: None,
             external_signature: None,
             telemetry: Default::default(),
+            cloud_route_id: None,
         }
     }
 
@@ -5420,6 +5430,7 @@ mod tests {
             source: None,
             external_signature: None,
             telemetry: Default::default(),
+            cloud_route_id: None,
         }
     }
 
@@ -5856,6 +5867,7 @@ mod tests {
             source: None,
             external_signature: None,
             telemetry: Default::default(),
+            cloud_route_id: None,
         };
         // Parked event row far from any drive → filtered. Must carry
         // actual Park telemetry: a gear-verified DRIVING event row with
@@ -6305,6 +6317,7 @@ mod tests {
             source: None,
             external_signature: None,
             telemetry: Default::default(),
+            cloud_route_id: None,
         };
         let parked = |file: &str| RouteSummary {
             file: file.to_string(),
@@ -6318,6 +6331,7 @@ mod tests {
             source: None,
             external_signature: None,
             telemetry: Default::default(),
+            cloud_route_id: None,
         };
         let summaries = vec![
             mk("2026-07-04/2026-07-04_20-43-50-front.mp4"),
@@ -6373,6 +6387,7 @@ mod tests {
                 hvac_runtime_s,
                 ..Default::default()
             },
+            cloud_route_id: None,
         }
     }
 
@@ -7475,6 +7490,7 @@ mod tests {
             source: None,
             external_signature: None,
             telemetry: Default::default(),
+            cloud_route_id: None,
         }
     }
 

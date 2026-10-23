@@ -374,6 +374,8 @@ pub struct DriveStore {
     drive_index_cache: Mutex<Option<(i64, Arc<crate::grouper::DriveIndex>)>>,
     /// Serializes drive-index builds so concurrent cold requests share one.
     drive_index_build: Mutex<()>,
+    /// `/api/drives/clip-ids` JSON for one route-source revision.
+    drive_clip_ids_cache: Mutex<Option<(i64, Arc<String>)>>,
     /// Serializes overview rebuilds. Without it, concurrent cold misses
     /// each ran the full-store decode — the single heaviest allocation in
     /// the process — so two map requests during an archive could stack
@@ -447,6 +449,7 @@ impl DriveStore {
             preview_plan_cache: Mutex::new(None),
             drive_index_cache: Mutex::new(None),
             drive_index_build: Mutex::new(()),
+            drive_clip_ids_cache: Mutex::new(None),
             overview_rebuild_lock: Mutex::new(()),
             route_overview_gen: AtomicU64::new(0),
         };
@@ -480,6 +483,7 @@ impl DriveStore {
             preview_plan_cache: Mutex::new(None),
             drive_index_cache: Mutex::new(None),
             drive_index_build: Mutex::new(()),
+            drive_clip_ids_cache: Mutex::new(None),
             overview_rebuild_lock: Mutex::new(()),
             route_overview_gen: AtomicU64::new(0),
         };
@@ -1083,6 +1087,66 @@ impl DriveStore {
         })?;
         *self.drive_index_cache.lock().unwrap() = Some((revision, Arc::clone(&index)));
         Ok((revision, index))
+    }
+
+    /// `{"<startTime>": ["<clip id>", ...]}` for every drive, keyed by the
+    /// drive list's millisecond start time, with the ETag it is served
+    /// under. Clip ids are the route's cached Sentry Cloud id, else the id
+    /// the uploader derives from the path. Built from the cached drive index
+    /// plus the upload ids (read from idx_routes_cloud_route_id, never full
+    /// rows) and reused until a route changes; the ETag carries the
+    /// route-source revision and the database's creation stamp, so a
+    /// recreated database can't reuse an old one.
+    ///
+    /// Drives the list hides (Tessie imports overlapping a dashcam drive)
+    /// are included under their own start times.
+    pub fn drive_clip_ids_json(&self) -> Result<(String, Arc<String>)> {
+        let created = self
+            .with_read_conn(|conn| schema::meta_get(conn, "created_at"))?
+            .unwrap_or_default();
+        let etag = |revision: i64| format!("\"clip-ids-{}-{revision}\"", created.replace('"', ""));
+        for _ in 0..2 {
+            let (revision, index) = self.drive_index()?;
+            if let Some((cached_at, json)) = self.drive_clip_ids_cache.lock().unwrap().as_ref() {
+                if *cached_at == revision {
+                    return Ok((etag(revision), Arc::clone(json)));
+                }
+            }
+            let (read_at, uploaded) = self.with_read_conn(|conn| -> Result<_> {
+                let tx = conn.unchecked_transaction()?;
+                let read_at = read_route_source_revision(&tx)?;
+                let mut stmt = tx.prepare_cached(
+                    "SELECT file, cloud_route_id FROM routes WHERE cloud_route_id IS NOT NULL",
+                )?;
+                let uploaded = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<rusqlite::Result<std::collections::HashMap<_, _>>>()?;
+                drop(stmt);
+                tx.commit()?;
+                Ok((read_at, uploaded))
+            })?;
+            if read_at != revision {
+                // A route changed between the two reads; take the new index.
+                continue;
+            }
+            let mut out = serde_json::Map::new();
+            for i in 0..index.len() {
+                let (Some(key), Some(files)) = (index.start_key(i), index.files(i)) else { continue };
+                let ids = files.iter().map(|file| match uploaded.get(file) {
+                    Some(id) => id.clone(),
+                    None => sentryusb_cloud_crypto::ids::route_id_from_path(file),
+                });
+                // Two drives can share a start time; keep every clip.
+                let entry = out.entry(key.to_string()).or_insert_with(|| serde_json::json!([]));
+                if let Some(list) = entry.as_array_mut() {
+                    list.extend(ids.map(serde_json::Value::String));
+                }
+            }
+            let json = Arc::new(serde_json::to_string(&out)?);
+            *self.drive_clip_ids_cache.lock().unwrap() = Some((revision, Arc::clone(&json)));
+            return Ok((etag(revision), json));
+        }
+        anyhow::bail!("routes kept changing while building clip ids; retry")
     }
 
     /// [`crate::grouper::find_drive_files`] through the cached drive index.
@@ -4573,7 +4637,8 @@ fn select_route_summaries_where(
                 ap_runs_blob,
                 ap_at_end, safety_imu_moving_ms, safety_night_ms,
                 safety_night_weighted_ms, safety_grace_ms_end,
-                safety_grace_prefix_blob
+                safety_grace_prefix_blob,
+                cloud_route_id
          FROM routes
          {where_sql}
          ORDER BY file",
@@ -4668,6 +4733,7 @@ fn select_route_summaries_where(
                 row.get::<_, Option<i64>>(60)?,
                 row.get::<_, Option<Vec<u8>>>(61)?,
             ),
+            row.get::<_, Option<String>>(62)?,
         ))
     })?;
 
@@ -4730,6 +4796,7 @@ fn select_route_summaries_where(
                 safety_grace_ms_end,
                 safety_grace_prefix_blob,
             ),
+            cloud_route_id,
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -4812,6 +4879,7 @@ fn select_route_summaries_where(
                 location_name_start,
                 location_name_end,
             },
+            cloud_route_id,
         });
     }
     Ok(out)
@@ -6733,6 +6801,61 @@ mod tests {
             stmt.query_map([], |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect()
         });
         assert!(plan.iter().any(|p| p.contains("COVERING INDEX idx_routes_overview_meta")), "{plan:?}");
+    }
+
+    #[test]
+    fn clip_ids_list_each_drives_cloud_ids_in_order() {
+        use sentryusb_cloud_crypto::ids::route_id_from_path;
+        let store = DriveStore::open_memory().unwrap();
+        let files = [
+            "2025-01-15_12-30-45-front.mp4",
+            "2025-01-15_12-31-45-front.mp4",
+            "2025-01-15_12-32-45-front.mp4",
+        ];
+        // Inserted out of order; the drive lists its clips in time order.
+        for file in [files[2], files[0], files[1]] {
+            add_test_drive_clip(&store, file, "2025-01-15");
+        }
+        // The middle clip was uploaded under an id that is not its path hash.
+        store.with_locked_conn(|c| -> Result<()> {
+            c.execute("UPDATE routes SET cloud_route_id='uploaded-id' WHERE file=?1", [files[1]])?;
+            Ok(())
+        }).unwrap();
+        let expected = vec![
+            route_id_from_path(files[0]),
+            "uploaded-id".to_string(),
+            route_id_from_path(files[2]),
+        ];
+
+        let (etag, json) = store.drive_clip_ids_json().unwrap();
+        let map: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(map, serde_json::json!({ "2025-01-15T12:30:45.000": expected }));
+        // The drive list itself is unchanged.
+        assert!(!store.get_cached_drives_json().unwrap().contains("clipIds"));
+        // Drive detail carries the same ids.
+        let detail = store
+            .resolve_drive_selection_cached("0", &std::collections::HashMap::new())
+            .unwrap()
+            .unwrap();
+        assert_eq!(detail.clip_ids, expected);
+        let full = store
+            .with_route_summaries(|s| crate::grouper::resolve_drive_selection(s, "0", &Default::default()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(full.clip_ids, expected);
+
+        // Same ETag until a route changes; then a new one and a new drive.
+        assert_eq!(store.drive_clip_ids_json().unwrap().0, etag);
+        add_test_drive_clip(&store, "2025-01-16_08-00-00-front.mp4", "2025-01-16");
+        let (new_etag, json) = store.drive_clip_ids_json().unwrap();
+        assert_ne!(new_etag, etag);
+        assert!(json.contains("2025-01-16T08:00:00.000"));
+
+        let plan: Vec<String> = store.with_read_conn(|c| {
+            let mut stmt = c.prepare("EXPLAIN QUERY PLAN SELECT file, cloud_route_id FROM routes WHERE cloud_route_id IS NOT NULL").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect()
+        });
+        assert!(plan.iter().any(|p| p.contains("COVERING INDEX idx_routes_cloud_route_id")), "{plan:?}");
     }
 
     #[test]

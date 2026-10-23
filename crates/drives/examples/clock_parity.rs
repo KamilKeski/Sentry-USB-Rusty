@@ -22,7 +22,7 @@ fn main()->anyhow::Result<()> {
         RouteSummary {file:route.file.clone(),date:route.date.clone(),raw_park_count:route.raw_park_count,
             raw_frame_count:route.raw_frame_count,gear_runs:route.gear_runs.clone(),flag_runs:route.flag_runs.clone(),
             ap_runs:route.ap_runs.clone(),source:route.source.clone(),external_signature:route.external_signature.clone(),
-            aggregates,telemetry:Default::default()}
+            aggregates,telemetry:Default::default(),cloud_route_id:None}
     }).collect();
     let tags=HashMap::new();let listed=grouper::group_summaries_fast(&summaries,&tags);
     let routes:Vec<_>=input.sources.into_iter().map(|source|source.original).collect();

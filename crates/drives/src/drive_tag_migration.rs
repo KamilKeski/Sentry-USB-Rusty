@@ -110,7 +110,7 @@ mod tests {
             raw_frame_count:runs.iter().map(|(_,n)|n).sum(),
             gear_runs:runs.iter().map(|&(gear,frames)|GearRun {gear,frames}).collect(),
             flag_runs:vec![],ap_runs:vec![],aggregates:RouteAggregates::default(),
-            source:None,external_signature:None,telemetry:Default::default()}
+            source:None,external_signature:None,telemetry:Default::default(),cloud_route_id:None}
     }
     #[test]
     fn merged_display_keeps_original_tags_on_distinct_frames() {

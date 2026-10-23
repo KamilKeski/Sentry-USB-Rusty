@@ -203,6 +203,53 @@ pub async fn list_drives(State(state): State<AppState>, Query(query): Query<Driv
     }
 }
 
+/// GET /api/drives/clip-ids: `{"<startTime>": ["<clip id>", ...]}`, each
+/// drive's Sentry Cloud clip ids for merging with cloud drives. Kept out of
+/// the drive list because ~34k 64-hex ids barely compress. Revalidate with
+/// If-None-Match; an unchanged library answers 304.
+pub async fn drive_clip_ids(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let store = state.drives.store.clone();
+    match tokio::task::spawn_blocking(move || store.drive_clip_ids_json()).await {
+        Ok(Ok((etag, json))) => clip_ids_response(
+            &etag,
+            json,
+            headers.get(axum::http::header::IF_NONE_MATCH),
+        ),
+        Ok(Err(error)) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
+        Err(_) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "clip ids task failed").into_response(),
+    }
+}
+
+fn clip_ids_response(
+    etag: &str,
+    json: std::sync::Arc<String>,
+    if_none_match: Option<&axum::http::HeaderValue>,
+) -> axum::response::Response {
+    use axum::http::header;
+    use axum::response::IntoResponse;
+    let matches = if_none_match
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').map(str::trim).any(|tag| tag == etag || tag == "*"));
+    let headers = [
+        (header::ETAG, etag.to_string()),
+        (header::CACHE_CONTROL, "no-cache".to_string()),
+    ];
+    if matches {
+        return (StatusCode::NOT_MODIFIED, headers).into_response();
+    }
+    (
+        StatusCode::OK,
+        headers,
+        [(header::CONTENT_TYPE, "application/json")],
+        json.as_str().to_string(),
+    )
+        .into_response()
+}
+
 /// Resolves a drive from BLOB-free summaries, then decodes only its route files.
 pub async fn single_drive(
     State(state): State<AppState>,
@@ -237,6 +284,7 @@ fn single_drive_blocking(
         Err(error)=>return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR,&error.to_string()),
     };
     let idx=selected.index;
+    let clip_ids=selected.clip_ids;
     let files=selected.files;
     let spans=selected.clip_spans_ms;
     let summary=Some(selected.summary);
@@ -262,6 +310,7 @@ fn single_drive_blocking(
     }
     match built {
         Ok((_, Some(mut drive))) => {
+            drive.clip_ids = clip_ids;
             if let Some(s) = summary.as_ref() {
                 // Keep per-point fields from the BLOB walk and headline fields canonical.
                 drive.distance_mi = s.distance_mi;
@@ -1420,5 +1469,39 @@ mod history_tests {
         assert_eq!(first["stats"],second["stats"]);
         assert_eq!(first["revision"],second["revision"]);
         assert!(second["drives"][0]["startTime"].as_str().unwrap().contains("T09:"));
+    }
+}
+
+#[cfg(test)]
+mod clip_ids_tests {
+    use super::*;
+    use axum::http::{header, HeaderValue};
+
+    async fn respond(if_none_match: Option<&str>) -> (StatusCode, Option<String>, String) {
+        let header_value = if_none_match.map(|v| HeaderValue::from_str(v).unwrap());
+        let response = clip_ids_response(
+            "\"clip-ids-db-7\"",
+            std::sync::Arc::new(r#"{"2025-01-15T12:30:45.000":["a","b"]}"#.to_string()),
+            header_value.as_ref(),
+        );
+        let status = response.status();
+        let etag = response.headers().get(header::ETAG).map(|v| v.to_str().unwrap().to_string());
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        (status, etag, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn clip_ids_revalidate_with_their_etag() {
+        let (status, etag, body) = respond(None).await;
+        assert_eq!((status, etag.as_deref()), (StatusCode::OK, Some("\"clip-ids-db-7\"")));
+        assert_eq!(body, r#"{"2025-01-15T12:30:45.000":["a","b"]}"#);
+
+        for current in ["\"clip-ids-db-7\"", "\"old\", \"clip-ids-db-7\"", "*"] {
+            let (status, etag, body) = respond(Some(current)).await;
+            assert_eq!(status, StatusCode::NOT_MODIFIED, "{current}");
+            assert_eq!(etag.as_deref(), Some("\"clip-ids-db-7\""));
+            assert!(body.is_empty());
+        }
+        assert_eq!(respond(Some("\"clip-ids-db-6\"")).await.0, StatusCode::OK);
     }
 }

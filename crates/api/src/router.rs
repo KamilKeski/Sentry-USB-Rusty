@@ -223,6 +223,7 @@ pub fn build_router(state: AppState) -> Router {
         // Drives
         .route("/api/drives", get(crate::drives_handler::list_drives))
         .route("/api/drives/routes", get(crate::drives_handler::all_routes))
+        .route("/api/drives/clip-ids", get(crate::drives_handler::drive_clip_ids))
         .route("/api/drives/tags", get(crate::drives_handler::list_tags))
         .route("/api/drives/process", get(crate::drives_handler::processing_status).post(crate::drives_handler::process_files))
         .route("/api/drives/reprocess", post(crate::drives_handler::reprocess_all))

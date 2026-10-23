@@ -2716,6 +2716,7 @@ dependencies = [
  "chrono",
  "libc",
  "rusqlite",
+ "sentryusb-cloud-crypto",
  "sentryusb-ws",
  "serde",
  "serde_json",

@@ -289,6 +289,10 @@ pub struct Drive {
     pub avg_speed_kmh: f64,
     pub max_speed_kmh: f64,
     pub clip_count: usize,
+    /// Sentry Cloud id of each clip, in clip order (see
+    /// [`RouteSummary::cloud_clip_id`]); the key for merging with cloud drives.
+    #[serde(default)]
+    pub clip_ids: Vec<String>,
     pub point_count: usize,
     pub points: Vec<[f64; 4]>,  // [lat, lng, timeMs, speedMps]
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -861,6 +865,20 @@ pub struct RouteSummary {
     /// v6 BLE telemetry rollup. Defaults to all-None for routes that
     /// predate the sampler or whose window never overlapped a sample.
     pub telemetry: RouteTelemetryAggregates,
+    /// The id this route was uploaded to Sentry Cloud under, once cached.
+    pub cloud_route_id: Option<String>,
+}
+
+impl RouteSummary {
+    /// The route's Sentry Cloud id: the cached upload id verbatim, else the
+    /// id the uploader would derive from the path (the rule in
+    /// cloud_uploader's encrypt_route).
+    pub fn cloud_clip_id(&self) -> String {
+        match &self.cloud_route_id {
+            Some(id) => id.clone(),
+            None => sentryusb_cloud_crypto::ids::route_id_from_path(&self.file),
+        }
+    }
 }
 
 /// Archive-side JSON structure that Sentry Studio reads from the archive

@@ -36,6 +36,7 @@ fn main() -> anyhow::Result<()> {
         aggregates: RouteAggregates { max_speed_mps: row.max_speed_mps.unwrap_or_default(), ..Default::default() },
         source: row.source, external_signature: row.external_signature,
         flag_runs: vec![], ap_runs: vec![], telemetry: Default::default(),
+        cloud_route_id: None,
     }).collect();
     let plan = timing_compatibility::plan(&summaries);
     let tag_plan = sentryusb_drives::drive_tag_migration::plan(&summaries,&input.tags)?;

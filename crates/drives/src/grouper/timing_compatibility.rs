@@ -92,6 +92,7 @@ mod tests {
             gear_runs: runs.iter().map(|&(gear, frames)| GearRun { gear, frames }).collect(),
             flag_runs: vec![], ap_runs: vec![], aggregates: RouteAggregates::default(),
             source: None, external_signature: None, telemetry: Default::default(),
+            cloud_route_id: None,
         }
     }
 
