@@ -66,7 +66,7 @@ run_cycle
 # ── post-archive-process.sh progress updates, against a scripted processor ──
 # The script runs with `set -uo pipefail` (no -e); match it.
 set +e
-eval "$(awk '/^ACTIVITY_MIN_GAP=/ {keep=1} /^# Process RecentClips/ {exit} keep {print}' "$root/run/post-archive-process.sh" | sed "s@/root/bin/@$work/bin/@g; s@/tmp/@$work/@g")"
+eval "$(awk '/^ACTIVITY_MIN_GAP=/ {keep=1} /^# Process RecentClips/ {exit} keep {print}' "$root/run/post-archive-process.sh" | sed "s@/tmp/@$work/@g; s@/root/bin/@$work/bin/@g")"
 API_URL=http://api
 ARCHIVE_CYCLE_QUERY=
 clock=1000
