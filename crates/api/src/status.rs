@@ -33,6 +33,34 @@ struct WifiAdapter {
     rate_state: &'static str,
 }
 
+/// Read association state through nl80211, including Wi-Fi 7 MLO output.
+/// A recognised disconnected result must not fall back to a configured SSID.
+fn apply_wifi_link(adapter: &mut WifiAdapter, link: &str, device_info: &str) -> bool {
+    let connected = link.lines().any(|line| line.trim_start().starts_with("Connected to "));
+    if !connected && !link.lines().any(|line| line.trim() == "Not connected.") {
+        return false;
+    }
+    adapter.connected = connected;
+    if !connected {
+        return true;
+    }
+
+    adapter.ssid = link.lines()
+        .find_map(|line| line.trim_start().strip_prefix("SSID: "))
+        .or_else(|| device_info.lines().find_map(|line| line.trim_start().strip_prefix("ssid ")))
+        .unwrap_or_default().to_string();
+    adapter.signal_dbm = link.lines().find_map(|line| {
+        let mut fields = line.trim_start().strip_prefix("signal:")?.split_whitespace();
+        let dbm = fields.next()?.parse::<f64>().ok()?;
+        (fields.next() == Some("dBm") && dbm.is_finite() && (-127.0..=0.0).contains(&dbm))
+            .then_some(dbm.round() as i32)
+    });
+    if let Some(dbm) = adapter.signal_dbm {
+        adapter.strength = format!("{}/70", dbm.clamp(-110, -40) + 110);
+    }
+    true
+}
+
 /// `iw link` may report decimal MHz; `iw info` supplies the primary channel.
 fn parse_wifi_radio(link: &str, device_info: &str) -> (String, Option<&'static str>, Option<u32>) {
     let mhz = link.lines().find_map(|line| {
@@ -121,6 +149,7 @@ struct CachedNetwork {
     ether_speed: String,
     /// Cached device names; signal and throughput remain live.
     wifi_dev: String,
+    wifi_source: &'static str,
     eth_dev: String,
 }
 
@@ -327,13 +356,15 @@ pub async fn get_status(
         }
     };
 
-    // Cache stable network identity; keep signal and throughput live.
+    // Cache nl80211 identity/signal; keep throughput live. Legacy drivers can
+    // still provide live signal through /proc/net/wireless.
     let net = cached_network().await;
     s.wifi_adapters = net.wifi_adapters;
     for adapter in &mut s.wifi_adapters {
         adapter.rate_state = "disconnected";
         if adapter.connected {
-            if let Some((strength, dbm)) = read_wireless_quality(&adapter.device) {
+            if adapter.signal_dbm.is_none()
+                && let Some((strength, dbm)) = read_wireless_quality(&adapter.device) {
                 adapter.strength = strength;
                 adapter.signal_dbm = dbm;
             }
@@ -349,9 +380,9 @@ pub async fn get_status(
     s.ether_ip = net.ether_ip;
     s.ether_speed = net.ether_speed;
     if !net.wifi_dev.is_empty() {
-        if let Some((strength, dbm)) = read_wireless_quality(&net.wifi_dev) {
-            s.wifi_strength = strength;
-            s.wifi_signal_dbm = dbm;
+        if let Some(adapter) = s.wifi_adapters.iter().find(|a| a.device == net.wifi_dev) {
+            s.wifi_strength = adapter.strength.clone();
+            s.wifi_signal_dbm = adapter.signal_dbm;
         }
         let (rx, tx, quality, age) = latest_throughput(&state.net_sampler, &net.wifi_dev);
         s.wifi_rx_bps = rx;
@@ -478,7 +509,8 @@ async fn compute_network_info() -> CachedNetwork {
     // Skip potentially blocking Wi-Fi commands when the interface is down.
     let mut devices: Vec<String> = std::fs::read_dir("/sys/class/net/")
         .into_iter().flatten().flatten()
-        .filter(|entry| entry.path().join("wireless").exists())
+        .filter(|entry| entry.path().join("phy80211").exists()
+            || entry.path().join("wireless").exists())
         .filter_map(|entry| entry.file_name().into_string().ok()).collect();
     devices.sort();
     for wifi_dev in devices {
@@ -487,20 +519,15 @@ async fn compute_network_info() -> CachedNetwork {
             info.wifi_adapters.push(adapter);
             continue;
         }
-        let ssid_args = ["-r", wifi_dev.as_str()];
         let ip_args = ["-4", "addr", "show", wifi_dev.as_str()];
         // `iw` reports frequency in MHz.
         let iw_args = ["dev", wifi_dev.as_str(), "link"];
         let iw_info_args = ["dev", wifi_dev.as_str(), "info"];
-        let (ssid_r, ip_r, iw_r, iw_info_r) = tokio::join!(
-            sentryusb_shell::run_with_timeout(Duration::from_secs(2), "iwgetid", &ssid_args),
+        let (ip_r, iw_r, iw_info_r) = tokio::join!(
             sentryusb_shell::run_with_timeout(Duration::from_secs(2), "ip", &ip_args),
             sentryusb_shell::run_with_timeout(Duration::from_secs(2), "iw", &iw_args),
             sentryusb_shell::run_with_timeout(Duration::from_secs(2), "iw", &iw_info_args),
         );
-        if let Ok(out) = ssid_r {
-            adapter.ssid = out.trim().to_string();
-        }
         if let Ok(out) = ip_r {
             for line in out.lines() {
                 let trimmed = line.trim();
@@ -511,13 +538,28 @@ async fn compute_network_info() -> CachedNetwork {
                 }
             }
         }
+        let mut source = "iw";
+        let mut association_known = false;
         if let Ok(out) = iw_r {
+            let device_info = iw_info_r.unwrap_or_default();
+            association_known = apply_wifi_link(&mut adapter, &out, &device_info);
             (adapter.link_rx_mbps, adapter.link_tx_mbps) = parse_wifi_link_rates(&out);
-            (adapter.freq, adapter.band, adapter.channel) = parse_wifi_radio(&out, &iw_info_r.unwrap_or_default());
+            (adapter.freq, adapter.band, adapter.channel) = parse_wifi_radio(&out, &device_info);
         }
-        adapter.connected = !adapter.ssid.is_empty();
+        // Wireless Extensions cannot report Wi-Fi 7/MLO associations. Query
+        // them only for older drivers that cannot answer the nl80211 query.
+        if !association_known {
+            source = "iwgetid";
+            if let Ok(out) = sentryusb_shell::run_with_timeout(
+                Duration::from_secs(2), "iwgetid", &["-r", wifi_dev.as_str()],
+            ).await {
+                adapter.ssid = out.trim().to_string();
+                adapter.connected = !adapter.ssid.is_empty();
+            }
+        }
         if adapter.connected && info.wifi_dev.is_empty() {
             info.wifi_dev = adapter.device.clone();
+            info.wifi_source = source;
             info.wifi_ssid = adapter.ssid.clone();
             info.wifi_ip = adapter.ip.clone();
             info.wifi_freq = adapter.freq.clone();
@@ -639,18 +681,16 @@ pub async fn get_wifi_config(
     let mut connected = false;
     let mut source = String::new();
 
-    // Prefer the kernel association query; `nmcli` may trigger a scan.
-    if let Ok(out) = sentryusb_shell::run("iwgetid", &["-r"]).await {
-        let s = out.trim();
-        if !s.is_empty() {
-            ssid = s.to_string();
-            connected = true;
-            source = "iwgetid".into();
-        }
+    // Share the modern association query with dashboard and BLE status.
+    let network = cached_network().await;
+    if !network.wifi_dev.is_empty() {
+        ssid = network.wifi_ssid;
+        connected = true;
+        source = network.wifi_source.into();
     }
 
     // Fall back to NetworkManager.
-    if ssid.is_empty() {
+    if !connected {
         if let Ok(out) = sentryusb_shell::run("nmcli", &["-t", "-f", "active,ssid", "dev", "wifi"]).await {
             for line in out.lines() {
                 if line.starts_with("yes:") {
@@ -664,7 +704,7 @@ pub async fn get_wifi_config(
     }
 
     // Fall back to configured wpa_supplicant networks.
-    if ssid.is_empty() {
+    if !connected && ssid.is_empty() {
         for p in &[
             "/etc/wpa_supplicant/wpa_supplicant.conf",
             "/boot/firmware/wpa_supplicant.conf",

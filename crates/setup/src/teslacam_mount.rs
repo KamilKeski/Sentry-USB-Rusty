@@ -48,7 +48,7 @@ pub async fn configure_web_mount(emitter: &SetupEmitter) -> Result<bool> {
     // itself requires no userspace tooling beyond `mount(8)` (built-in).
     crate::apt::apt_install(
         |m| emitter.progress(m),
-        &["net-tools", "wireless-tools", "ethtool"],
+        &["net-tools", "iw", "wireless-tools", "ethtool"],
         Duration::from_secs(300),
     ).await.context("failed to install networking runtime packages")?;
 
