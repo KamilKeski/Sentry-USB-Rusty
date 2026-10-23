@@ -18,6 +18,12 @@ for name in names:
 Path(sys.argv[2], 'functions').write_text('\n'.join(functions))
 PY
 source "$work/functions"
+# The waits count SECONDS against a deadline. Bash's SECONDS keeps adding
+# real time to whatever is assigned, so a slow runner crossing a wall-clock
+# second mid-loop would end a wait one fake sleep early. Unset, it is an
+# ordinary variable that only the fake sleep below advances.
+unset SECONDS
+SECONDS=0
 pipeline_source=$(declare -f archive_clips)
 log() { printf '%s\n' "$*" >> "$work/log"; }
 archive_is_reachable() { [[ $reachable == 1 ]]; }
