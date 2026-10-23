@@ -2954,7 +2954,7 @@ impl DriveStore {
             // keys) could hold rows past the cutoff that the full
             // rebuild would group — bail rather than silently drop them.
             let unknown: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM routes WHERE                    (file < 'A' AND file NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*')                    OR (file >= 'A'                        AND file NOT LIKE 'SavedClips/%'                        AND file NOT LIKE 'SentryClips/%'                        AND file NOT LIKE 'tessie/%'))",
+                UNKNOWN_ROUTE_PATHS_SQL,
                 [],
                 |r| r.get(0),
             )?;
@@ -4253,15 +4253,12 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
 /// grouping topology consults, no point data. gear_states and event
 /// speeds are decoded per row, reduced to scalars, and dropped.
 fn select_overview_metas(conn: &Connection) -> Result<Vec<crate::grouper::OverviewClipMeta>> {
+    // Answered from idx_routes_overview_meta: point_count is written with
+    // points_blob (always its length / 16), and the speeds only event rows
+    // need are fetched by key below, so the scan never touches a full row.
     let mut stmt = conn.prepare_cached(
-        "SELECT file,
-                coalesce(length(points_blob), 0) / 16,
-                gear_states_blob, gear_runs_blob,
-                raw_park_count, raw_frame_count,
-                CASE WHEN file LIKE 'SavedClips/%' OR file LIKE 'SentryClips/%'
-                          OR file LIKE 'SavedClips\\%' OR file LIKE 'SentryClips\\%'
-                     THEN speeds_blob ELSE NULL END,
-                source, external_signature
+        "SELECT file, point_count, gear_states_blob, gear_runs_blob,
+                raw_park_count, raw_frame_count, source, external_signature
          FROM routes
          ORDER BY file",
     )?;
@@ -4273,22 +4270,22 @@ fn select_overview_metas(conn: &Connection) -> Result<Vec<crate::grouper::Overvi
             row.get::<_, Option<Vec<u8>>>(3)?,
             row.get::<_, i64>(4)?,
             row.get::<_, i64>(5)?,
-            row.get::<_, Option<Vec<u8>>>(6)?,
+            row.get::<_, Option<String>>(6)?,
             row.get::<_, Option<String>>(7)?,
-            row.get::<_, Option<String>>(8)?,
         ))
     })?;
 
     let mut out = Vec::new();
+    let mut event_rows = Vec::new();
     for r in rows {
-        let (file, n_points, gs_blob, gr_blob, park, frame, sp_blob, source, sig) = r?;
+        let (file, n_points, gs_blob, gr_blob, park, frame, source, sig) = r?;
         let gear_states = decode_u8s(gs_blob.as_deref()).unwrap_or_default();
         let gear_runs = decode_gear_runs(gr_blob.as_deref())
             .with_context(|| format!("decode gear_runs {}", file))?
             .unwrap_or_default();
-        let speeds = decode_f32s(sp_blob.as_deref())
-            .with_context(|| format!("decode speeds {}", file))?
-            .unwrap_or_default();
+        if is_event_folder_route(&file) {
+            event_rows.push(out.len());
+        }
         out.push(crate::grouper::OverviewClipMeta {
             file,
             n_points: n_points.max(0) as usize,
@@ -4301,12 +4298,33 @@ fn select_overview_metas(conn: &Connection) -> Result<Vec<crate::grouper::Overvi
                 .count(),
             raw_park_count: park.max(0) as u32,
             raw_frame_count: frame.max(0) as u32,
-            speeds_driving: crate::grouper::speeds_driving(&speeds),
+            speeds_driving: false,
             source,
             external_signature: sig,
         });
     }
+
+    // Speeds matter only for event rows (gap-fill), so read just those.
+    let mut speeds = conn.prepare_cached("SELECT speeds_blob FROM routes WHERE file = ?1")?;
+    for i in event_rows {
+        let blob: Option<Vec<u8>> = speeds
+            .query_row([&out[i].file], |row| row.get(0))
+            .optional()?
+            .flatten();
+        let decoded = decode_f32s(blob.as_deref())
+            .with_context(|| format!("decode speeds {}", out[i].file))?
+            .unwrap_or_default();
+        out[i].speeds_driving = crate::grouper::speeds_driving(&decoded);
+    }
     Ok(out)
+}
+
+/// The SQL `file LIKE 'SavedClips/%' OR 'SentryClips/%'` test (either slash;
+/// LIKE ignores ASCII case) that chose which rows' speeds the metadata read.
+fn is_event_folder_route(file: &str) -> bool {
+    ["SavedClips/", "SentryClips/", "SavedClips\\", "SentryClips\\"].iter().any(|prefix| {
+        file.get(..prefix.len()).is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+    })
 }
 
 /// Decoded points for the named files, chunked IN-lookups on the PK.
@@ -4501,6 +4519,18 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
 /// v6 telemetry rollups. The telemetry columns may be NULL on pre-v6
 /// rows or routes whose 60s window had no samples; the consumer
 /// handles that via the `Option` shape inside `RouteTelemetryAggregates`.
+/// Whether any route lives outside the path families the drive-list window
+/// refresh selects (date-keyed, Saved/Sentry event folders, Tessie imports).
+///
+/// `+file` keeps the planner off the primary key: routes is WITHOUT ROWID,
+/// so a primary-key scan reads every full row (point BLOBs and all, seconds
+/// on a large library). Every secondary index carries the key, so this
+/// scans the small idx_routes_date_dir instead.
+const UNKNOWN_ROUTE_PATHS_SQL: &str = "SELECT EXISTS(SELECT 1 FROM routes WHERE \
+     (+file < 'A' AND +file NOT GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]*') \
+     OR (+file >= 'A' AND +file NOT LIKE 'SavedClips/%' \
+         AND +file NOT LIKE 'SentryClips/%' AND +file NOT LIKE 'tessie/%'))";
+
 fn read_route_source_revision(conn: &Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT revision FROM mutable_route_source_clock WHERE id=1", [], |r| r.get(0))?)
 }
@@ -6640,6 +6670,69 @@ mod tests {
             store.find_drive_start_time_cached("1").unwrap().as_deref(),
             Some("2025-01-16T08:00:00.000")
         );
+    }
+
+    #[test]
+    fn unknown_route_path_check_scans_an_index_not_the_rows() {
+        let store = DriveStore::open_memory().unwrap();
+        let unknown = |store: &DriveStore| -> bool {
+            store.with_read_conn(|c| c.query_row(UNKNOWN_ROUTE_PATHS_SQL, [], |r| r.get(0))).unwrap()
+        };
+        let plan: Vec<String> = store.with_read_conn(|c| {
+            let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {UNKNOWN_ROUTE_PATHS_SQL}")).unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect()
+        });
+        assert!(plan.iter().any(|step| step.contains("COVERING INDEX")), "{plan:?}");
+
+        for file in ["2025-01-15_12-30-45-front.mp4", "2025-01-16/2025-01-16_08-00-00-front.mp4",
+            "SavedClips/2025-01-15_12-30-45/front.mp4", "SentryClips/x/front.mp4", "tessie/2025-01-15/a"] {
+            add_test_drive_clip(&store, file, "2025-01-15");
+        }
+        assert!(!unknown(&store));
+        add_test_drive_clip(&store, "teslascope/2025-01-15/a", "2025-01-15");
+        assert!(unknown(&store));
+    }
+
+    #[test]
+    fn overview_metas_from_the_index_match_the_full_routes() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4195], [37.7751, -122.4196]];
+        let add = |file: &str, gears: &[u8], speeds: &[f32], runs: &[GearRun]| {
+            store.add_route(file, "2025-01-15", &pts, gears, &[0, 0, 0], speeds, &[0.0; 3], 1, 3, runs, &[]).unwrap();
+        };
+        add("2025-01-15_12-30-45-front.mp4", &[1, 1, 0], &[10.0, 9.0, 0.0], &[GearRun { gear: 1, frames: 3 }]);
+        add("2025-01-15_12-31-45-front.mp4", &[0, 0, 0], &[0.0; 3], &[]);
+        // Event clips: one driving, one parked, one with a backslash path
+        // and odd case (the LIKE test is case-insensitive).
+        add("SavedClips/2025-01-15_12-29-00/2025-01-15_12-28-00-front.mp4", &[1, 1, 1], &[12.0, 12.0, 12.0], &[]);
+        add("SentryClips/2025-01-15_13-00-00/2025-01-15_12-59-00-front.mp4", &[0, 0, 0], &[0.0; 3], &[]);
+        add("savedclips\\2025-01-15_14-00-00\\2025-01-15_13-59-00-front.mp4", &[1, 1, 1], &[8.0, 8.0, 8.0], &[]);
+
+        let view = |m: &crate::grouper::OverviewClipMeta| {
+            (m.file.clone(), m.n_points, m.gear_runs.iter().map(|r| (r.gear, r.frames)).collect::<Vec<_>>(),
+             m.gear_states_len, m.gear_states_non_park,
+             m.gear_states_park_count, m.raw_park_count, m.raw_frame_count, m.speeds_driving,
+             m.source.clone(), m.external_signature.clone())
+        };
+        let from_index: Vec<_> = store
+            .with_read_conn(select_overview_metas).unwrap().iter().map(view).collect();
+        let mut expected: Vec<_> = store.get_routes().unwrap().iter()
+            .map(crate::grouper::OverviewClipMeta::from_route).map(|m| {
+                // The old read took speeds only for event rows.
+                let mut v = view(&m);
+                v.8 = v.8 && is_event_folder_route(&m.file);
+                v
+            }).collect();
+        expected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(from_index, expected);
+        assert!(from_index.iter().filter(|m| m.8).count() == 2, "both driving event clips");
+
+        let plan: Vec<String> = store.with_read_conn(|c| {
+            let mut stmt = c.prepare("EXPLAIN QUERY PLAN SELECT file, point_count, gear_states_blob, gear_runs_blob, \
+                raw_park_count, raw_frame_count, source, external_signature FROM routes ORDER BY file").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(3)).unwrap().map(Result::unwrap).collect()
+        });
+        assert!(plan.iter().any(|p| p.contains("COVERING INDEX idx_routes_overview_meta")), "{plan:?}");
     }
 
     #[test]

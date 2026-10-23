@@ -271,6 +271,16 @@ const CLOUD_ROUTE_ID_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_routes_cloud_route_id \
      ON routes(cloud_route_id) WHERE cloud_route_id IS NOT NULL";
 
+/// The route-preview plan reads a few metadata columns of every route, but
+/// routes is WITHOUT ROWID, so a table scan walks every full row (point
+/// BLOBs and all): 5-10 s on a 34k-route, 654 MB library. Covering: led by
+/// the primary key so the scan comes out in file order. About 18 MB on that
+/// library, mostly the per-point gear states.
+const ROUTE_OVERVIEW_META_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_routes_overview_meta \
+     ON routes(file, point_count, raw_park_count, raw_frame_count, source, \
+               external_signature, gear_runs_blob, gear_states_blob)";
+
 /// TPMS rows are ~5% of `telemetry_samples` (7,977 of a 30-day window on
 /// a measured device), but `/api/telemetry/tire-history` had to walk the
 /// whole window to find them — 5.2s during an archive, holding one of
@@ -879,6 +889,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         (TELEMETRY_CHARGE_INDEX, "idx_telemetry_charge_ts"),
         (CLOUD_ROUTE_ID_INDEX, "idx_routes_cloud_route_id"),
         (TELEMETRY_TIRE_INDEX, "idx_telemetry_tire_ts"),
+        (ROUTE_OVERVIEW_META_INDEX, "idx_routes_overview_meta"),
     ] {
         // Existence probe is for LOGGING only — never fail migration on
         // it. Treat an unreadable catalog as "unknown" and carry on; the
