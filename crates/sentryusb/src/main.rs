@@ -388,6 +388,8 @@ async fn serve_with_common_layers(
     // at /var/www/html/TeslaCam. Modern browsers (Chrome 80+, Firefox 70+,
     // Safari iOS 13+, ExoPlayer) parse Tesla's `ctts` atom natively, so
     // no FUSE wrapper is needed.
+    // Clips whose index sits at the end are served index-first (see
+    // teslacam_media); everything else comes straight from ServeDir.
     // Both media mounts sit outside /api, so they carry the web login gate
     // themselves.
     app = app.nest_service(
@@ -395,7 +397,11 @@ async fn serve_with_common_layers(
         sentryusb_api::auth::login_gated(
             auth.clone(),
             axum::Router::new()
-                .fallback_service(tower_http::services::ServeDir::new("/var/www/html/TeslaCam")),
+                .fallback_service(tower_http::services::ServeDir::new("/var/www/html/TeslaCam"))
+                .layer(axum::middleware::from_fn_with_state(
+                    sentryusb_api::teslacam_media::IndexFirstMedia::new("/var/www/html/TeslaCam"),
+                    sentryusb_api::teslacam_media::serve_index_first,
+                )),
         ),
     );
 
