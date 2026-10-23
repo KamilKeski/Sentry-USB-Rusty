@@ -6,8 +6,13 @@
 //!
 //! `run/archiveloop` parses `state_age=<n>s` from the final line. Keep the
 //! field and suffix synchronized with its watchdog parser.
+//!
+//! A trailing `drive_too_large=<n>` counts `state drive` polls the car
+//! refused as too large since the previous line (navigation active while
+//! moving); it's omitted when zero.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -23,6 +28,22 @@ const CAM_DISK_PATH: &str = "/backingfiles/cam_disk.bin";
 const TICK: Duration = Duration::from_secs(60);
 /// Rotation threshold; only the newest half is retained.
 const ROTATE_AT_BYTES: u64 = 5 * 1024 * 1024; // 5 MB
+
+/// `state drive` polls refused as too large since the last line.
+static DRIVE_TOO_LARGE: AtomicU32 = AtomicU32::new(0);
+/// Whether the latest `state drive` poll was refused as too large.
+static DRIVE_TOO_LARGE_STREAK: AtomicBool = AtomicBool::new(false);
+
+/// Counts a refused `state drive` poll. True when it starts a streak.
+pub fn note_drive_too_large() -> bool {
+    DRIVE_TOO_LARGE.fetch_add(1, Ordering::Relaxed);
+    !DRIVE_TOO_LARGE_STREAK.swap(true, Ordering::Relaxed)
+}
+
+/// Marks a readable `state drive` poll. True when it ends a streak.
+pub fn end_drive_too_large_streak() -> bool {
+    DRIVE_TOO_LARGE_STREAK.swap(false, Ordering::Relaxed)
+}
 
 /// Spawns the process-lifetime logger task.
 pub fn spawn(db_path: PathBuf) {
@@ -107,8 +128,15 @@ fn build_line(db_path: &Path) -> Result<String> {
         CarState::Asleep => "Asleep",
     };
 
+    let too_large = DRIVE_TOO_LARGE.swap(0, Ordering::Relaxed);
+    let too_large = if too_large > 0 {
+        format!(" drive_too_large={too_large}")
+    } else {
+        String::new()
+    };
+
     Ok(format!(
-        "[{ts_str}] car={car_label} cam_age={cam_age}s state_age={state} bc_age={bc} samples_10m={samples_10m}\n",
+        "[{ts_str}] car={car_label} cam_age={cam_age}s state_age={state} bc_age={bc} samples_10m={samples_10m}{too_large}\n",
         ts_str = ts_str,
         car_label = car_label,
         cam_age = cam_age_secs,

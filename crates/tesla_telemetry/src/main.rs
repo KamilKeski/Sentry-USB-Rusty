@@ -191,6 +191,15 @@ fn is_driving(shift: Option<&TimedReading<sample::ShiftState>>) -> bool {
     )
 }
 
+/// The gear to hold while the car refuses `state drive` as too large: a
+/// fresh moving gear stays, anything else becomes Drive.
+fn gear_while_too_large(shift: Option<&TimedReading<sample::ShiftState>>) -> sample::ShiftState {
+    match shift {
+        Some(reading) if is_driving(Some(reading)) => reading.value,
+        _ => sample::ShiftState::Drive,
+    }
+}
+
 /// Per-command "next due" timestamps for the Active-mode scheduler.
 /// Each tick walks the poll types in priority order and runs any due;
 /// `state drive` goes first (shiftState + locationName + odometer).
@@ -1153,6 +1162,25 @@ async fn tick(
                     if d.lon.is_some() {
                         *last_lon = d.lon;
                     }
+                    if diag_log::end_drive_too_large_streak() {
+                        info!("state drive readable again");
+                    }
+                    true
+                }
+                Err(e) if sentryusb_tesla_ble::manager::is_response_too_large(&e) => {
+                    // The car refuses `state drive` when the reply would
+                    // exceed its BLE response limit, which an active
+                    // navigation route causes while moving
+                    // (vehicle-command#472). Parked replies fit even with a
+                    // route, so the refusal means the car is moving: hold a
+                    // fresh moving gear, else Drive, and keep the driving
+                    // cadence rather than fast-retrying.
+                    let gear = gear_while_too_large(last_shift_state.as_ref());
+                    *last_shift_state = Some(TimedReading::now(gear));
+                    shift_state_observed = Some(gear);
+                    if diag_log::note_drive_too_large() {
+                        info!("state drive refused as too large (navigation active?) — holding {gear:?} while moving");
+                    }
                     true
                 }
                 Err(e) => {
@@ -2075,7 +2103,18 @@ mod tests {
     }
 
     #[test]
-    fn only_a_fresh_moving_gear_counts_as_driving() {
+    fn a_too_large_drive_reply_holds_a_moving_gear() {
+        use sample::ShiftState::*;
+        let fresh = |gear| reading_aged(gear, Duration::from_secs(4));
+        assert_eq!(gear_while_too_large(Some(&fresh(Reverse))), Reverse);
+        assert_eq!(gear_while_too_large(Some(&fresh(Neutral))), Neutral);
+        assert_eq!(gear_while_too_large(Some(&fresh(Park))), Drive);
+        assert_eq!(gear_while_too_large(Some(&reading_aged(Reverse, DRIVING_GEAR_MAX_AGE))), Drive);
+        assert_eq!(gear_while_too_large(None), Drive);
+    }
+
+    #[test]
+        fn only_a_fresh_moving_gear_counts_as_driving() {
         use sample::ShiftState::*;
         let fresh = |gear| reading_aged(gear, Duration::from_secs(4));
         for gear in [Drive, Reverse, Neutral] {

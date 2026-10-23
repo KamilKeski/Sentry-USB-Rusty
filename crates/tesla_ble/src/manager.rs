@@ -142,6 +142,29 @@ pub fn is_connect_failure(e: &anyhow::Error) -> bool {
     e.downcast_ref::<ConnectFailure>().is_some()
 }
 
+/// Marker error: the car answered, but refused because its reply would
+/// exceed the BLE response limit (MESSAGEFAULT_ERROR_RESPONSE_MTU_EXCEEDED).
+/// The link is healthy. `state drive` hits this while moving with a
+/// navigation route active (vehicle-command#472). Check with
+/// [`is_response_too_large`].
+#[derive(Debug, Clone, Copy)]
+pub struct ResponseTooLarge;
+
+impl std::fmt::Display for ResponseTooLarge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Avoids the substrings is_transport_error matches on: the link
+        // must stay up.
+        f.write_str("car refused: reply exceeds its response size limit (fault 25)")
+    }
+}
+
+impl std::error::Error for ResponseTooLarge {}
+
+/// Whether `e` carries a [`ResponseTooLarge`] marker anywhere in its chain.
+pub fn is_response_too_large(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ResponseTooLarge>().is_some()
+}
+
 enum Command {
     Query {
         domain: Domain,
@@ -1110,6 +1133,11 @@ async fn try_signed_request_once(
             );
             state.domains.remove(&domain);
         }
+        const FAULT_RESPONSE_MTU_EXCEEDED: u32 = 25;
+        if fault == FAULT_RESPONSE_MTU_EXCEEDED {
+            return Err(anyhow::Error::new(ResponseTooLarge))
+                .with_context(|| format!("{:?} query", domain));
+        }
         bail!("car responded with fault code {}", fault);
     }
 
@@ -1239,6 +1267,10 @@ async fn handle_transport_error_if_any<T>(
     result: &Result<T>,
 ) {
     if let Err(e) = result {
+        // An answer from a healthy link, not a fault.
+        if is_response_too_large(e) {
+            return;
+        }
         let fault = fault_for_anyhow_error(e);
         record_health_fault(fault);
 
@@ -2123,7 +2155,8 @@ async fn capture_recent_bluetooth_dmesg() -> Option<String> {
 mod tests {
     use super::{
         fault_for_anyhow_error, fault_for_session_error, is_decrypt_error,
-        is_query_response_timeout, is_repair_required_fault_code, is_transport_error,
+        is_query_response_timeout, is_repair_required_fault_code, is_response_too_large,
+        is_transport_error, ResponseTooLarge,
     };
     use sentryusb_ble_health::FaultKind;
 
@@ -2180,6 +2213,15 @@ mod tests {
                 "{msg} is a link-side error, not a response-side timeout"
             );
         }
+    }
+
+    #[test]
+    fn response_too_large_is_recognised_and_keeps_the_link() {
+        let e = anyhow::Error::new(ResponseTooLarge).context("Infotainment query");
+        assert!(is_response_too_large(&e));
+        assert!(!is_transport_error(&e));
+        assert!(!is_query_response_timeout(&e));
+        assert!(!is_response_too_large(&anyhow::anyhow!("car responded with fault code 24")));
     }
 
     #[test]
