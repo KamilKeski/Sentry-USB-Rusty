@@ -12,6 +12,14 @@ MOCK = r'''#!/usr/bin/env python3
 import configparser, json, os, sys
 from pathlib import Path
 root = Path(os.environ['AP_TEST_ROOT'])
+PHY_DUAL_BAND = """Wiphy phy0
+\tBand 1:
+\t\tFrequencies:
+\t\t\t* 2412.0 MHz [1] (20.0 dBm)
+\tBand 2:
+\t\tFrequencies:
+\t\t\t* 5180.0 MHz [36] (20.0 dBm)
+\t\t\t* 5260.0 MHz [52] (20.0 dBm) (radar detection)"""
 name, args = Path(sys.argv[0]).name, sys.argv[1:]
 if name == 'timeout': os.execvp(args[1], args[1:])
 if name in ('sleep', 'flock', 'hostapd'): sys.exit(0)
@@ -35,7 +43,17 @@ if name == 'systemctl':
         for interface in state.get('netplan', []): print('netplan-wpa-' + interface + '.service generated -')
     elif op in ('start', 'stop'):
         if unit == 'netplan-wpa-wlan0.service': state['wpa'] = op == 'start'
-        elif unit == 'sentryusb-networkd-ap.service': state['hostapd'] = op == 'start'
+        elif unit == 'sentryusb-networkd-ap.service':
+            state['hostapd'] = op == 'start'
+            if op == 'start':
+                # The band comes from the runtime config the drop-in points at.
+                conf = (root / 'run/sentryusb-networkd-ap-band/hostapd.conf').read_text()
+                fields = dict(line.split('=', 1) for line in conf.splitlines() if '=' in line)
+                band = fields['hw_mode'] + ' ' + fields['channel']
+                state.setdefault('bands_tried', []).append(band)
+                state['band'] = band
+                if fields['hw_mode'] == 'a' and state.get('fail_5ghz'):
+                    state['hostapd'] = False  # hostapd never reaches ENABLED on 5 GHz
         elif unit != 'sentryusb-ap-resurrect.service': raise Exception('unexpected unit ' + unit)
         save()
     elif op != 'daemon-reload': raise Exception(call)
@@ -48,7 +66,10 @@ elif name == 'networkctl':
     elif args not in (['reload'], ['reconfigure', 'wlan0']): raise Exception(call)
     save()
 elif name == 'iw':
-    if args == ['dev', 'ap0', 'info']: sys.exit(0 if state['ap'] else 1)
+    if args == ['dev', 'ap0', 'info']:
+        if not state['ap']: sys.exit(1)
+        print('Interface ap0\n\tifindex 5\n\twiphy 0')
+    elif args == ['phy', 'phy0', 'info']: print(state.get('phy_info', PHY_DUAL_BAND))
     elif args == ['dev', 'wlan0', 'info']: print('Interface wlan0')
     elif args == ['dev', 'wlan0', 'interface', 'add', 'ap0', 'type', '__ap']:
         assert not state['wpa'], 'the station/P2P owner must release the radio first'
@@ -276,6 +297,8 @@ class NetworkdAP(unittest.TestCase):
 
     def test_each_start_failure_restores_home_wifi(self):
         self.run_helper('configure')
+        # One band keeps this about the restore path (band fallback has its own tests).
+        self.write_state(phy_info='\t\t\t* 2412.0 MHz [1] (20.0 dBm)')
         for failure in ('iw dev wlan0 interface add ap0 type __ap', 'networkctl reload',
                         'networkctl reconfigure ap0', 'systemctl start sentryusb-networkd-ap.service'):
             with self.subTest(failure=failure):
@@ -294,6 +317,60 @@ class NetworkdAP(unittest.TestCase):
         self.write_state(fail='ss -4 -H -u -l -n -p sport = :67')
         result = self.run_helper('start', success=False)
         self.assertIn('DHCP server is not listening on ap0', result.stderr)
+        self.assert_restored()
+
+    def band_files(self):
+        return (self.root / 'run/sentryusb-networkd-ap-band/hostapd.conf',
+                self.root / 'run/systemd/system/sentryusb-networkd-ap.service.d/90-sentryusb-band.conf')
+
+    def test_hotspot_prefers_5ghz_without_touching_the_saved_profile(self):
+        self.run_helper('configure')
+        saved = (self.root / 'etc/sentryusb/networkd-ap/hostapd.conf').read_text()
+        self.run_helper('start')
+        self.assertEqual(self.state()['bands_tried'], ['a 36'])
+        self.run_helper('check')
+        conf, dropin = self.band_files()
+        self.assertIn('hw_mode=a\nchannel=36\n', conf.read_text())
+        self.assertEqual(conf.stat().st_mode & 0o777, 0o600)
+        self.assertIn('ExecStart=\nExecStart=' + str(self.root / 'bin/hostapd') + ' ' + str(conf), dropin.read_text())
+        self.assertEqual((self.root / 'etc/sentryusb/networkd-ap/hostapd.conf').read_text(), saved)
+        self.assertIn('hw_mode=g\nchannel=1\n', saved)
+        self.run_helper('stop')
+        self.assert_restored()
+        self.run_helper('remove')
+        self.assertFalse(any(path.exists() for path in self.band_files()))
+
+    def test_5ghz_channel_skips_radar_no_ir_and_disabled_channels(self):
+        self.run_helper('configure')
+        self.write_state(phy_info='\n'.join([
+            '\t\t\t* 2412.0 MHz [1] (20.0 dBm)',
+            '\t\t\t* 5180.0 MHz [36] (20.0 dBm) (no IR)',
+            '\t\t\t* 5200.0 MHz [40] (disabled)',
+            '\t\t\t* 5260.0 MHz [52] (20.0 dBm) (radar detection)',
+            '\t\t\t* 6695 MHz [149] (20.0 dBm)',
+            '\t\t\t* 5745 MHz [149] (20.0 dBm)']))
+        self.run_helper('start')
+        self.assertEqual(self.state()['bands_tried'], ['a 149'])
+        self.run_helper('stop')
+        self.assert_restored()
+
+    def test_falls_back_to_2_4ghz_without_usable_5ghz(self):
+        self.run_helper('configure')
+        self.write_state(phy_info='\t\t\t* 2412.0 MHz [1] (20.0 dBm)\n\t\t\t* 5180.0 MHz [36] (no IR)')
+        self.run_helper('start')
+        self.assertEqual(self.state()['bands_tried'], ['g 1'])
+        self.run_helper('check')
+        self.run_helper('stop')
+        self.assert_restored()
+
+    def test_falls_back_to_2_4ghz_when_5ghz_does_not_come_up(self):
+        self.run_helper('configure')
+        self.write_state(fail_5ghz=True)
+        self.run_helper('start')
+        self.assertEqual(self.state()['bands_tried'], ['a 36', 'g 1'])
+        self.assertIn('hw_mode=g\nchannel=1\n', self.band_files()[0].read_text())
+        self.run_helper('check')
+        self.run_helper('stop')
         self.assert_restored()
 
     def test_unowned_ap_is_not_removed(self):

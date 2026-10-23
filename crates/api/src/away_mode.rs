@@ -23,6 +23,65 @@ const IFUPDOWN_AP_FILE: &str = "/etc/network/interfaces.d/sentryusb-ap";
 const DEFAULT_AP_CHANNEL: u32 = 36;
 const DEFAULT_AP_HW_MODE: &str = "a";
 
+/// 5 GHz channels a hotspot may use without radar detection, preferred first.
+const FIVE_GHZ_AP_CHANNELS: [u32; 9] = [36, 40, 44, 48, 149, 153, 157, 161, 165];
+
+/// The band the NetworkManager hotspot is started on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApBand {
+    /// No band set: the shared radio stays on the home network's channel.
+    FollowStation,
+    FiveGhz(u32),
+    TwoPointFourGhz,
+}
+
+/// Bands to try, in order. Connected to home Wi-Fi, the radio can only use
+/// the home network's channel. Away, prefer 5 GHz when the radio offers a
+/// usable channel, with 2.4 GHz as the fallback.
+fn ap_band_plan(station_connected: bool, five_ghz_channel: Option<u32>) -> Vec<ApBand> {
+    if station_connected {
+        return vec![ApBand::FollowStation];
+    }
+    five_ghz_channel.map(ApBand::FiveGhz).into_iter().chain([ApBand::TwoPointFourGhz]).collect()
+}
+
+/// First of [`FIVE_GHZ_AP_CHANNELS`] that `iw phy <phy> info` lists without
+/// a restriction (disabled, no IR, radar detection, passive scanning). None
+/// when the radio has no usable 5 GHz channel. The frequency is checked too:
+/// 6 GHz channels reuse some of these numbers.
+fn usable_five_ghz_channel(phy_info: &str) -> Option<u32> {
+    let mut usable = std::collections::HashSet::new();
+    for line in phy_info.lines() {
+        let Some(rest) = line.trim().strip_prefix("* ") else { continue };
+        let Some((freq, rest)) = rest.split_once(" MHz [") else { continue };
+        let Some((channel, flags)) = rest.split_once(']') else { continue };
+        let (Ok(freq), Ok(channel)) = (freq.parse::<f64>(), channel.parse::<u32>()) else { continue };
+        let restricted = ["disabled", "no IR", "radar", "passive"].iter().any(|f| flags.contains(f));
+        if !restricted && freq == f64::from(5000 + 5 * channel) {
+            usable.insert(channel);
+        }
+    }
+    FIVE_GHZ_AP_CHANNELS.into_iter().find(|channel| usable.contains(channel))
+}
+
+/// The `phyN` name from `iw dev <dev> info`.
+fn wiphy_of(dev_info: &str) -> Option<String> {
+    dev_info.lines().find_map(|line| {
+        let index = line.trim().strip_prefix("wiphy ")?.trim();
+        index.parse::<u32>().ok().map(|n| format!("phy{n}"))
+    })
+}
+
+/// Whether a Wi-Fi client device (not the hotspot) is connected, from
+/// `nmcli -t -f DEVICE,TYPE,STATE device status`.
+fn station_connected_in(status: &str) -> bool {
+    status.lines().any(|line| {
+        let mut fields = line.split(':');
+        matches!((fields.next(), fields.next(), fields.next()),
+            (Some(device), Some("wifi"), Some("connected")) if device != "ap0")
+    })
+}
+
 /// Detects whether Wi-Fi is managed by NetworkManager or ifupdown.
 fn use_networkmanager() -> bool {
     std::process::Command::new("systemctl")
@@ -483,6 +542,66 @@ async fn wait_for_ap0_ready() -> bool {
     false
 }
 
+async fn station_connected() -> bool {
+    sentryusb_shell::run("nmcli", &["-t", "-f", "DEVICE,TYPE,STATE", "device", "status"])
+        .await
+        .is_ok_and(|status| station_connected_in(&status))
+}
+
+/// The best 5 GHz channel the hotspot's radio allows, if any.
+async fn five_ghz_channel() -> Option<u32> {
+    let info = sentryusb_shell::run("iw", &["dev", "ap0", "info"]).await.ok()?;
+    let phy = wiphy_of(&info)?;
+    let phy_info = sentryusb_shell::run("iw", &["phy", &phy, "info"]).await.ok()?;
+    usable_five_ghz_channel(&phy_info)
+}
+
+/// Sets the hotspot profile's band in NetworkManager's memory only: the
+/// root filesystem is read-only, and after a reboot the saved profile (no
+/// band, follow the station) applies again.
+async fn set_ap_band(band: ApBand) -> Result<(), String> {
+    let (band_value, channel) = match band {
+        ApBand::FollowStation => ("".to_string(), 0),
+        ApBand::FiveGhz(channel) => ("a".to_string(), channel),
+        ApBand::TwoPointFourGhz => ("bg".to_string(), 0),
+    };
+    let channel = channel.to_string();
+    sentryusb_shell::run("nmcli", &[
+        "con", "modify", "--temporary", AP_PROFILE,
+        "802-11-wireless.band", &band_value, "802-11-wireless.channel", &channel,
+    ])
+    .await
+    .map(|_| ())
+    .map_err(|e| format!("setting hotspot band: {e}"))
+}
+
+/// Starts the NetworkManager hotspot on the first band in `plan` that works.
+async fn activate_ap(plan: &[ApBand]) -> Result<(), String> {
+    let mut last_error = String::from("no band to try");
+    for &band in plan {
+        if let Err(e) = set_ap_band(band).await {
+            away_mode_log(&format!("{e}; trying the next band"));
+            last_error = e;
+            continue;
+        }
+        match sentryusb_shell::run_with_timeout(
+            Duration::from_secs(45), "nmcli", &["--wait", "30", "con", "up", AP_PROFILE],
+        ).await {
+            Ok(_) => {
+                away_mode_log(&format!("AP started ({band:?})"));
+                info!("[away-mode] AP started ({band:?})");
+                return Ok(());
+            }
+            Err(e) => {
+                away_mode_log(&format!("AP did not start ({band:?}): {e}"));
+                warn!("[away-mode] AP did not start ({band:?}): {e}");
+                last_error = e.to_string();
+            }
+        }
+    }
+    Err(format!("Failed to bring up AP: {last_error}"))
+}
+
 async fn start_ap() -> Result<(), String> {
         if networkd::applicable().await.map_err(|error| format!("{error:#}"))? {
             return networkd::start().await.map_err(|error| format!("{error:#}"));
@@ -496,15 +615,23 @@ async fn start_ap() -> Result<(), String> {
                 );
                 warn!("[away-mode] ap0 not ready within timeout; activating anyway");
             }
-            match sentryusb_shell::run("nmcli", &["con", "up", AP_PROFILE]).await {
-                Ok(_) => {
-                    away_mode_log("AP started");
-                    info!("[away-mode] AP started");
-                }
-                Err(e) => {
-                    return Err(format!("Failed to bring up AP: {e}"));
+            // Away from home the radio is free to pick: 5 GHz first, then
+            // 2.4 GHz. At home it must stay on the home network's channel.
+            let plan = if station_connected().await {
+                ap_band_plan(true, None)
+            } else {
+                ap_band_plan(false, five_ghz_channel().await)
+            };
+            let started = activate_ap(&plan).await;
+            // Leave the profile band-free so later starts at home (the
+            // dispatcher, Wi-Fi recovery) follow the station again. The
+            // running hotspot keeps its band until it is restarted.
+            if plan != [ApBand::FollowStation] {
+                if let Err(e) = set_ap_band(ApBand::FollowStation).await {
+                    warn!("[away-mode] {e}");
                 }
             }
+            started?;
         } else {
             // Shared-radio chipsets require AP and station to share a channel.
             let (channel, hw_mode) = detect_sta_channel()
@@ -1464,4 +1591,51 @@ fn status_snapshot_sync(inner: &Inner) -> serde_json::Value {
         }
     }
     v
+}
+
+#[cfg(test)]
+mod ap_band_tests {
+    use super::*;
+
+    const PHY: &str = "Wiphy phy0
+	Band 1:
+		Frequencies:
+			* 2412.0 MHz [1] (20.0 dBm)
+			* 2437.0 MHz [6] (20.0 dBm)
+	Band 2:
+		Frequencies:
+			* 5180.0 MHz [36] (20.0 dBm) (no IR)
+			* 5200.0 MHz [40] (20.0 dBm)
+			* 5260.0 MHz [52] (20.0 dBm) (radar detection)
+			* 5745.0 MHz [149] (disabled)
+";
+
+    #[test]
+    fn picks_the_first_unrestricted_non_radar_5ghz_channel() {
+        assert_eq!(usable_five_ghz_channel(PHY), Some(40));
+        let only_restricted = PHY.replace("* 5200.0 MHz [40] (20.0 dBm)", "* 5200.0 MHz [40] (disabled)");
+        assert_eq!(usable_five_ghz_channel(&only_restricted), None);
+        // A 2.4 GHz-only radio (Pi Zero 2 W, Pi 3B).
+        let two_four_only: String = PHY.lines().take(6).map(|l| format!("{l}\n")).collect();
+        assert_eq!(usable_five_ghz_channel(&two_four_only), None);
+        // 6 GHz reuses channel numbers; 6695 MHz [149] is not 5 GHz channel 149.
+        assert_eq!(usable_five_ghz_channel("\t\t\t* 6695 MHz [149] (20.0 dBm)\n"), None);
+        assert_eq!(usable_five_ghz_channel("\t\t\t* 5745 MHz [149] (20.0 dBm)\n"), Some(149));
+    }
+
+    #[test]
+    fn reads_the_radio_and_station_state() {
+        assert_eq!(wiphy_of("Interface ap0\n\tifindex 4\n\twiphy 0\n").as_deref(), Some("phy0"));
+        assert_eq!(wiphy_of("Interface ap0\n"), None);
+        assert!(station_connected_in("wlan0:wifi:connected\nap0:wifi:connected\n"));
+        assert!(!station_connected_in("wlan0:wifi:disconnected\nap0:wifi:connected\n"));
+        assert!(!station_connected_in("wlan0:wifi:connecting (configuring)\np2p-dev-wlan0:wifi-p2p:connected\n"));
+    }
+
+    #[test]
+    fn away_tries_5ghz_then_2_4ghz_and_home_follows_the_station() {
+        assert_eq!(ap_band_plan(true, Some(36)), vec![ApBand::FollowStation]);
+        assert_eq!(ap_band_plan(false, Some(36)), vec![ApBand::FiveGhz(36), ApBand::TwoPointFourGhz]);
+        assert_eq!(ap_band_plan(false, None), vec![ApBand::TwoPointFourGhz]);
+    }
 }

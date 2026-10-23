@@ -11,6 +11,12 @@ SERVICE=sentryusb-networkd-ap.service
 RUNTIME=/run/sentryusb-networkd-ap
 OWNER=/run/sentryusb-networkd-ap-owner
 RESURRECTOR=/etc/systemd/system/sentryusb-ap-resurrect.service.d/20-networkd-ap.conf
+# Each start picks a band; its hostapd config and service override live in
+# /run, so they work with /etc read-only and never touch the saved profile.
+BAND_DIR=/run/sentryusb-networkd-ap-band
+BAND_DROPIN=/run/systemd/system/sentryusb-networkd-ap.service.d/90-sentryusb-band.conf
+# 5 GHz channels a hotspot may use without radar detection, preferred first.
+FIVE_GHZ_CHANNELS='36 40 44 48 149 153 157 161 165'
 
 # Bound child commands as well as the API's overall operation deadline, so a
 # killed helper cannot leave a late systemctl job racing the recovery helper.
@@ -164,6 +170,34 @@ stop_ap() {
   return "$rc"
 }
 
+# First preferred 5 GHz channel the radio lists without a restriction
+# (disabled, no IR, radar detection, passive scanning). The frequency is
+# matched too: 6 GHz channels reuse some of these numbers.
+five_ghz_channel() {
+  local info channel freq
+  info=$(iw phy "$1" info 2>/dev/null) || return 1
+  for channel in $FIVE_GHZ_CHANNELS; do
+    freq=$((5000 + 5 * channel))
+    if grep -E "^[[:space:]]*\* $freq(\.0)? MHz \[$channel\]" <<< "$info" | grep -qvE 'disabled|no IR|radar|passive'; then
+      printf '%s\n' "$channel"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Point the hostapd service at a copy of the saved config on this band.
+use_band() {
+  local mode=$1 channel=$2 hostapd_bin
+  hostapd_bin=$(command -v hostapd) || fail 'hostapd is not installed'
+  install -d -m 0700 "$BAND_DIR"
+  sed -e "s/^hw_mode=.*/hw_mode=$mode/" -e "s/^channel=.*/channel=$channel/" "$CONFIG/hostapd.conf" > "$BAND_DIR/hostapd.conf"
+  install -d -m 0755 "${BAND_DROPIN%/*}"
+  printf '[Service]\nExecStart=\nExecStart=%s %s\n' "$hostapd_bin" "$BAND_DIR/hostapd.conf" > "$BAND_DROPIN"
+  chmod 0644 "$BAND_DROPIN"
+  systemctl daemon-reload
+}
+
 prepare_runtime_dhcp() {
   local directory=${DHCP_OVERRIDE%/*} temporary
   local settings=$'[DHCPServer]\nPersistLeases=no\nBindToInterface=yes'
@@ -235,15 +269,30 @@ start_ap() {
     sleep 0.25
   done
   [ "$configured" = 1 ] || fail 'networkd could not configure ap0'
-  if ! systemctl start "$SERVICE"; then
+  # The home connection is down, so the radio is free: prefer 5 GHz on a
+  # channel it allows, and fall back to 2.4 GHz when it has none or hostapd
+  # can't bring 5 GHz up.
+  local phy channel band started=0
+  local bands=()
+  phy=$(iw dev ap0 info 2>/dev/null | awk '$1 == "wiphy" { print "phy" $2; exit }') || true
+  if [ -n "$phy" ] && channel=$(five_ghz_channel "$phy"); then bands+=("a $channel"); fi
+  bands+=("g 1")
+  for band in "${bands[@]}"; do
+    # shellcheck disable=SC2086 # "mode channel"
+    use_band $band
+    if ! systemctl start "$SERVICE"; then
+      journalctl -u "$SERVICE" -n 8 --no-pager >&2 || true
+      continue
+    fi
+    started=1
+    for attempt in {1..40}; do
+      if ready; then trap - EXIT; return 0; fi
+      sleep 0.25
+    done
     journalctl -u "$SERVICE" -n 8 --no-pager >&2 || true
-    fail 'hostapd service failed to start'
-  fi
-  for attempt in {1..40}; do
-    if ready; then trap - EXIT; return 0; fi
-    sleep 0.25
+    systemctl stop "$SERVICE" || true
   done
-  journalctl -u "$SERVICE" -n 8 --no-pager >&2 || true
+  [ "$started" = 1 ] || fail 'hostapd service failed to start'
   timeout 3 journalctl -b -u systemd-networkd.service -u systemd-networkd-persistent-storage.service -n 12 --no-pager >&2 || true
   fail "hotspot failed to become ready: $READY_ERROR"
 }
@@ -265,6 +314,8 @@ case "$action" in
   remove)
     stop_ap
     rm -f "$CONFIG/station" "$CONFIG/ssid" "$CONFIG/ip" "$CONFIG/hostapd.conf" "$NETWORK" "$UNIT" "$RESURRECTOR" "$DHCP_OVERRIDE"
+    rm -rf "$BAND_DIR" "$BAND_DROPIN"
+    rmdir "${BAND_DROPIN%/*}" 2>/dev/null || true
     rmdir "$CONFIG" 2>/dev/null || true
     rmdir "${DHCP_OVERRIDE%/*}" 2>/dev/null || true
     systemctl daemon-reload
