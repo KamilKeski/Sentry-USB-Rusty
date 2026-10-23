@@ -1870,7 +1870,7 @@ function archive_teslacam_clips () {
       # through drive processing ("Preparing…" until the processor has a
       # count); archive_clips ends it once processing and upload finish.
       if [ "${LIVE_ACTIVITY_ACTIVE:-0}" = "1" ]; then
-        /root/bin/send-live-activity update processing 0 0 0 || true
+        /root/bin/send-live-activity update processing 0 0 0 0 high || true
       fi
     fi
 

@@ -175,7 +175,8 @@ rm -f /tmp/archive_status.json /tmp/archive_status.json.tmp
 
 # Live Activity progress, only for the activity archiveloop started this
 # cycle (LIVE_ACTIVITY_ACTIVE=1). Sent when the counts change, at most every
-# ACTIVITY_MIN_GAP seconds, plus a heartbeat that keeps the ETA fresh.
+# ACTIVITY_MIN_GAP seconds, plus a heartbeat that keeps the ETA fresh. A
+# new total goes at high priority; routine progress at normal.
 # Total 0 = the processor hasn't counted yet (the widget shows "Preparing…").
 ACTIVITY_MIN_GAP=5
 ACTIVITY_HEARTBEAT=30
@@ -190,7 +191,9 @@ function send_processing_activity() {
     return 0
   fi
   [ "$since" -ge "$ACTIVITY_MIN_GAP" ] || return 0
-  /root/bin/send-live-activity update processing "$current" "$total" "$eta" || true
+  local priority=""
+  [ "$total" = "${activity_last_counts#* }" ] || priority=high
+  /root/bin/send-live-activity update processing "$current" "$total" "$eta" $priority || true
   activity_last_sent=$now
   activity_last_counts="$current $total"
 }

@@ -17,7 +17,7 @@ archive_cancel_requested() { return 1; }
 # The copy step itself never ends the activity; it hands over to processing.
 copy_step=$(awk '/^function archive_teslacam_clips / {keep=1} /^function / && !/archive_teslacam_clips/ && keep {exit} keep {print}' "$root/run/archiveloop")
 ! grep -q 'send-live-activity end' <<< "$copy_step" || { echo 'copy step ends the Live Activity'; exit 1; }
-grep -q 'send-live-activity update processing 0 0 0' <<< "$copy_step"
+grep -q 'send-live-activity update processing 0 0 0 0 high' <<< "$copy_step"
 
 # ── archive_clips with hardware and network boundaries stubbed ──
 eval "$(awk '/^function archive_wait_for_processor / {keep=1} /^function slowblink / {exit} keep {print}' "$root/run/archiveloop" | sed "s@/root/bin/@$work/bin/@g; s@/mutable/@$work/mutable/@g")"
@@ -103,7 +103,8 @@ LIVE_ACTIVITY_ACTIVE=1
 process_clips_dir /clips
 # Counting shows "Preparing…" (total 0); each count change goes out; the
 # unchanged 3/10 stretch sends only the 30 s heartbeat; then the final count.
-expected=$'activity update processing 0 0 0\nactivity update processing 0 10 50\nactivity update processing 3 10 35\nactivity update processing 3 10 5\nactivity update processing 10 10 0'
+# A new total goes at high priority.
+expected=$'activity update processing 0 0 0 high\nactivity update processing 0 10 50 high\nactivity update processing 3 10 35\nactivity update processing 3 10 5\nactivity update processing 10 10 0'
 [[ $(cat "$work/calls") == "$expected" ]] || { echo "unexpected processing updates:"; cat "$work/calls"; exit 1; }
 
 # No activity started this cycle: no updates at all.

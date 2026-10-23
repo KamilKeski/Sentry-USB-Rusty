@@ -3,7 +3,7 @@
 # Uses both push-to-start (native) and silent push (fallback) for reliability.
 # Usage:
 #   send-live-activity start [total_files]
-#   send-live-activity update <phase> <current> <total> [eta_seconds]
+#   send-live-activity update <phase> <current> <total> [eta_seconds] [high]
 #   send-live-activity end [phase]
 
 source /root/bin/envsetup.sh 2>/dev/null || true
@@ -46,15 +46,26 @@ case "$ACTION" in
     CURRENT="${3:-0}"
     TOTAL="${4:-0}"
     ETA="${5:-0}"
-    curl -sf --connect-timeout 2 --max-time 3 -X POST \
+    # "high" for a phase change or a new count; routine progress goes at
+    # normal priority so iOS doesn't throttle the activity.
+    PRIORITY=normal
+    [ "${6:-}" = "high" ] && PRIORITY=high
+    # The finish time lets the card count down between updates.
+    ENDS_AT=null
+    [ "$ETA" -gt 0 ] 2>/dev/null && ENDS_AT=$(( $(date +%s) + ETA ))
+    # In the background, with room for a slow uplink: an archive saturating
+    # Wi-Fi made 3 s sends fail, and the caller mustn't wait on the relay.
+    ( curl -sf --connect-timeout 5 --max-time 15 -X POST \
       -H "Content-Type: application/json" \
       -H "X-Device-Secret: $MOBILE_PUSH_SECRET" \
       -d "{
         \"device_id\": \"${MOBILE_PUSH_DEVICE_ID}\",
-        \"content_state\": {\"phase\": \"${PHASE}\", \"current\": ${CURRENT}, \"total\": ${TOTAL}, \"isArchiving\": true, \"etaSeconds\": ${ETA}},
-        \"event\": \"update\"
+        \"content_state\": {\"phase\": \"${PHASE}\", \"current\": ${CURRENT}, \"total\": ${TOTAL}, \"isArchiving\": true, \"etaSeconds\": ${ETA}, \"etaEndsAt\": ${ENDS_AT}},
+        \"event\": \"update\",
+        \"priority\": \"${PRIORITY}\",
+        \"stale_seconds\": 900
       }" \
-      "${BACKEND_URL}/send-activity-update" > /dev/null 2>&1 || true
+      "${BACKEND_URL}/send-activity-update" > /dev/null 2>&1 || true ) &
     ;;
   end)
     PHASE="${2:-complete}"
