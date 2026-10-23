@@ -369,6 +369,11 @@ pub struct DriveStore {
     route_overview_cache: Mutex<Option<RouteOverviewCache>>,
     /// One revision of grouping metadata; point BLOBs stay request-local.
     preview_plan_cache: Mutex<Option<Arc<RoutePreviewPlanCache>>>,
+    /// Drive grouping for one route-source revision, for resolving drive
+    /// ids without re-reading every route summary per request.
+    drive_index_cache: Mutex<Option<(i64, Arc<crate::grouper::DriveIndex>)>>,
+    /// Serializes drive-index builds so concurrent cold requests share one.
+    drive_index_build: Mutex<()>,
     /// Serializes overview rebuilds. Without it, concurrent cold misses
     /// each ran the full-store decode — the single heaviest allocation in
     /// the process — so two map requests during an archive could stack
@@ -440,6 +445,8 @@ impl DriveStore {
             rebuild_lock: Mutex::new(()),
             route_overview_cache: Mutex::new(None),
             preview_plan_cache: Mutex::new(None),
+            drive_index_cache: Mutex::new(None),
+            drive_index_build: Mutex::new(()),
             overview_rebuild_lock: Mutex::new(()),
             route_overview_gen: AtomicU64::new(0),
         };
@@ -471,6 +478,8 @@ impl DriveStore {
             rebuild_lock: Mutex::new(()),
             route_overview_cache: Mutex::new(None),
             preview_plan_cache: Mutex::new(None),
+            drive_index_cache: Mutex::new(None),
+            drive_index_build: Mutex::new(()),
             overview_rebuild_lock: Mutex::new(()),
             route_overview_gen: AtomicU64::new(0),
         };
@@ -1046,6 +1055,110 @@ impl DriveStore {
         self.with_read_conn(|conn| {
             let summaries = select_all_route_summaries(conn)?;
             Ok(f(&summaries))
+        })
+    }
+
+    /// The drive grouping and the route-source revision it was built at.
+    /// Built from one read snapshot (revision and summaries together) and
+    /// reused until a route changes; reading every summary is the costly
+    /// part of resolving a drive id.
+    pub fn drive_index(&self) -> Result<(i64, Arc<crate::grouper::DriveIndex>)> {
+        let current = self.with_read_conn(read_route_source_revision)?;
+        let cached = |cache: &Option<(i64, Arc<crate::grouper::DriveIndex>)>| {
+            cache.as_ref().filter(|(revision, _)| *revision == current).map(|(r, i)| (*r, Arc::clone(i)))
+        };
+        if let Some(hit) = cached(&self.drive_index_cache.lock().unwrap()) {
+            return Ok(hit);
+        }
+        let _build = self.drive_index_build.lock().unwrap();
+        if let Some(hit) = cached(&self.drive_index_cache.lock().unwrap()) {
+            return Ok(hit);
+        }
+        let (revision, index) = self.with_read_conn(|conn| -> Result<_> {
+            let tx = conn.unchecked_transaction()?;
+            let revision = read_route_source_revision(&tx)?;
+            let index = crate::grouper::DriveIndex::build(&select_all_route_summaries(&tx)?);
+            tx.commit()?;
+            Ok((revision, Arc::new(index)))
+        })?;
+        *self.drive_index_cache.lock().unwrap() = Some((revision, Arc::clone(&index)));
+        Ok((revision, index))
+    }
+
+    /// [`crate::grouper::find_drive_files`] through the cached drive index.
+    /// Legacy second-precision ids fall back to the full regrouping.
+    pub fn find_drive_files_cached(&self, id: &str) -> Result<Option<(usize, Vec<String>)>> {
+        use crate::grouper::IndexedId;
+        let (_, index) = self.drive_index()?;
+        match index.resolve(id) {
+            IndexedId::Found(i) => Ok(index.files(i).map(|files| (i, files))),
+            IndexedId::Missing => Ok(None),
+            IndexedId::NeedsLegacy => {
+                self.with_route_summaries(|summaries| crate::grouper::find_drive_files(summaries, id))
+            }
+        }
+    }
+
+    /// [`crate::grouper::find_drive_start_time`] through the cached index.
+    pub fn find_drive_start_time_cached(&self, id: &str) -> Result<Option<String>> {
+        use crate::grouper::IndexedId;
+        let (_, index) = self.drive_index()?;
+        match index.resolve(id) {
+            IndexedId::Found(i) => Ok(index.start_key(i).map(str::to_string)),
+            IndexedId::Missing => Ok(None),
+            IndexedId::NeedsLegacy => self
+                .with_route_summaries(|summaries| crate::grouper::find_drive_start_time(summaries, id)),
+        }
+    }
+
+    /// [`crate::grouper::resolve_drive_selection`] through the cached index,
+    /// reading only the drive's own summaries. Legacy ids, and routes that
+    /// changed after the index was read, take the full regrouping.
+    pub fn resolve_drive_selection_cached(
+        &self,
+        id: &str,
+        tags: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<Option<crate::grouper::DriveSelection>> {
+        use crate::grouper::IndexedId;
+        let (revision, index) = self.drive_index()?;
+        let full = || {
+            self.with_route_summaries(|summaries| {
+                crate::grouper::resolve_drive_selection(summaries, id, tags)
+            })
+        };
+        match index.resolve(id) {
+            IndexedId::Missing => Ok(None),
+            IndexedId::NeedsLegacy => full(),
+            IndexedId::Found(i) => {
+                let files = index.files(i).unwrap_or_default();
+                let (read_at, summaries) = self.route_summaries_for_files(&files)?;
+                if read_at != revision {
+                    return full();
+                }
+                match index.selection(i, &summaries, tags) {
+                    Some(selection) => Ok(Some(selection)),
+                    None => full(),
+                }
+            }
+        }
+    }
+
+    /// Summaries of just `files`, with the route-source revision of the
+    /// snapshot they were read from.
+    pub fn route_summaries_for_files(&self, files: &[String]) -> Result<(i64, Vec<RouteSummary>)> {
+        self.with_read_conn(|conn| -> Result<_> {
+            let tx = conn.unchecked_transaction()?;
+            let revision = read_route_source_revision(&tx)?;
+            let mut rows = Vec::new();
+            // Stay well under SQLite's bound-parameter limit.
+            for chunk in files.chunks(500) {
+                let where_sql = format!("WHERE file IN ({})", vec!["?"; chunk.len()].join(","));
+                let params: Vec<&dyn rusqlite::ToSql> =
+                    chunk.iter().map(|f| f as &dyn rusqlite::ToSql).collect();
+                rows.extend(select_route_summaries_where(&tx, &where_sql, &params)?);
+            }
+            tx.commit()?;
+            Ok((revision, rows))
         })
     }
 
@@ -4388,6 +4501,10 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
 /// v6 telemetry rollups. The telemetry columns may be NULL on pre-v6
 /// rows or routes whose 60s window had no samples; the consumer
 /// handles that via the `Option` shape inside `RouteTelemetryAggregates`.
+fn read_route_source_revision(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("SELECT revision FROM mutable_route_source_clock WHERE id=1", [], |r| r.get(0))?)
+}
+
 fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
     select_route_summaries_where(conn, "", &[])
 }
@@ -6453,6 +6570,76 @@ mod tests {
             })
             .unwrap();
         assert_eq!(drive_after_good, vec!["Work".to_string()]);
+    }
+
+    fn add_test_drive_clip(store: &DriveStore, file: &str, day: &str) {
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4195]];
+        store
+            .add_route(file, day, &pts, &[4, 4], &[0, 0], &[10.0, 10.0], &[0.0, 0.0], 0, 2,
+                &[GearRun { gear: 4, frames: 2 }], &[])
+            .unwrap();
+    }
+
+    fn selection_view(s: &crate::grouper::DriveSelection) -> (usize, Vec<String>, Vec<(String, i64)>, serde_json::Value) {
+        let mut spans: Vec<_> = s.clip_spans_ms.iter().map(|(f, ms)| (f.clone(), *ms)).collect();
+        spans.sort();
+        (s.index, s.files.clone(), spans, serde_json::to_value(&s.summary).unwrap())
+    }
+
+    #[test]
+    fn cached_drive_resolution_matches_the_full_regrouping() {
+        use crate::grouper;
+        let store = DriveStore::open_memory().unwrap();
+        add_test_drive_clip(&store, "2025-01-15_12-30-45-front.mp4", "2025-01-15");
+        add_test_drive_clip(&store, "2025-01-15_12-31-45-front.mp4", "2025-01-15");
+        add_test_drive_clip(&store, "2025-01-15_18-00-00-front.mp4", "2025-01-15");
+        add_test_drive_clip(&store, "2025-01-16_08-00-00-front.mp4", "2025-01-16");
+        store.set_drive_tags("2025-01-15T18:00:00.000", &["Work".to_string()]).unwrap();
+        let tags = store.get_all_drive_tags().unwrap();
+
+        let (_, index) = store.drive_index().unwrap();
+        assert_eq!(index.len(), 3);
+        let mut ids: Vec<String> = (0..index.len()).map(|i| i.to_string()).collect();
+        ids.extend((0..index.len()).map(|i| index.start_key(i).unwrap().to_string()));
+        // Legacy whole-second alias, out of range, and an unknown time.
+        ids.extend(["2025-01-15T12:30:45", "999", "2030-01-01T00:00:00.000"].map(String::from));
+        for id in &ids {
+            let full = store
+                .with_route_summaries(|s| grouper::resolve_drive_selection(s, id, &tags))
+                .unwrap();
+            let cached = store.resolve_drive_selection_cached(id, &tags).unwrap();
+            assert_eq!(full.as_ref().map(selection_view), cached.as_ref().map(selection_view), "{id}");
+            assert_eq!(
+                store.with_route_summaries(|s| grouper::find_drive_files(s, id)).unwrap(),
+                store.find_drive_files_cached(id).unwrap(),
+                "{id}"
+            );
+            assert_eq!(
+                store.with_route_summaries(|s| grouper::find_drive_start_time(s, id)).unwrap(),
+                store.find_drive_start_time_cached(id).unwrap(),
+                "{id}"
+            );
+        }
+        assert!(store.resolve_drive_selection_cached("1", &tags).unwrap().unwrap().summary.tags
+            .contains(&"Work".to_string()));
+    }
+
+    #[test]
+    fn drive_index_is_reused_until_a_route_changes() {
+        let store = DriveStore::open_memory().unwrap();
+        add_test_drive_clip(&store, "2025-01-15_12-30-45-front.mp4", "2025-01-15");
+        let (first_revision, first) = store.drive_index().unwrap();
+        let (_, again) = store.drive_index().unwrap();
+        assert!(Arc::ptr_eq(&first, &again), "warm lookups must reuse the grouping");
+
+        add_test_drive_clip(&store, "2025-01-16_08-00-00-front.mp4", "2025-01-16");
+        let (revision, rebuilt) = store.drive_index().unwrap();
+        assert!(revision > first_revision);
+        assert_eq!(rebuilt.len(), 2);
+        assert_eq!(
+            store.find_drive_start_time_cached("1").unwrap().as_deref(),
+            Some("2025-01-16T08:00:00.000")
+        );
     }
 
     #[test]

@@ -231,8 +231,7 @@ fn single_drive_blocking(
     };
     // Resolve summary, file membership and bounded parent spans in one grouping
     // pass. A parked following clip may bound this drive without belonging to it.
-    let selected=match store.with_route_summaries(|summaries|
-        grouper::resolve_drive_selection(summaries,&id,&tags)) {
+    let selected=match store.resolve_drive_selection_cached(&id,&tags) {
         Ok(Some(selected))=>selected,
         Ok(None)=>return crate::json_error(StatusCode::NOT_FOUND,"drive selection not found or ambiguous"),
         Err(error)=>return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR,&error.to_string()),
@@ -1042,31 +1041,42 @@ fn bulk_delete_drives_blocking(
     store: std::sync::Arc<sentryusb_drives::DriveStore>,
     ids: Vec<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // Resolve all IDs in one summary pass.
-    let (files, drive_keys, not_found): (Vec<String>, Vec<String>, Vec<String>) = match store
-        .with_route_summaries(|summaries| {
-            let mut files = std::collections::HashSet::new();
-            let mut keys = std::collections::HashSet::new();
-            let mut missing = Vec::new();
-            for id in &ids {
-                let resolved = grouper::find_drive_files(summaries, id);
-                let key = grouper::find_drive_start_time(summaries, id);
-                match (resolved, key) {
-                    (Some((_, fs)), Some(k)) => {
-                        for f in fs {
-                            files.insert(f);
-                        }
-                        keys.insert(k);
-                    }
-                    _ => missing.push(id.clone()),
+    // Resolve all IDs against one cached grouping; only legacy
+    // second-precision ids need the full summary pass.
+    let (files, drive_keys, not_found): (Vec<String>, Vec<String>, Vec<String>) = match (|| {
+        use sentryusb_drives::grouper::IndexedId;
+        let (_, index) = store.drive_index()?;
+        let mut files = std::collections::HashSet::new();
+        let mut keys = std::collections::HashSet::new();
+        let mut missing = Vec::new();
+        let mut legacy = Vec::new();
+        for id in &ids {
+            match index.resolve(id) {
+                IndexedId::Found(i) => {
+                    files.extend(index.files(i).unwrap_or_default());
+                    keys.extend(index.start_key(i).map(str::to_string));
                 }
+                IndexedId::Missing => missing.push(id.clone()),
+                IndexedId::NeedsLegacy => legacy.push(id.clone()),
             }
-            (
-                files.into_iter().collect(),
-                keys.into_iter().collect(),
-                missing,
-            )
-        }) {
+        }
+        if !legacy.is_empty() {
+            store.with_route_summaries(|summaries| {
+                for id in &legacy {
+                    let resolved = grouper::find_drive_files(summaries, id);
+                    let key = grouper::find_drive_start_time(summaries, id);
+                    match (resolved, key) {
+                        (Some((_, fs)), Some(k)) => {
+                            files.extend(fs);
+                            keys.insert(k);
+                        }
+                        _ => missing.push(id.clone()),
+                    }
+                }
+            })?;
+        }
+        anyhow::Ok((files.into_iter().collect(), keys.into_iter().collect(), missing))
+    })() {
         Ok(v) => v,
         Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
@@ -1114,9 +1124,7 @@ fn set_drive_tags_blocking(
     tags: Vec<String>,
     add: bool,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let key = match store
-        .with_route_summaries(|summaries| grouper::find_drive_start_time(summaries, &id))
-    {
+    let key = match store.find_drive_start_time_cached(&id) {
         Ok(Some(k)) => k,
         Ok(None) => {
             return crate::json_error(
@@ -1151,9 +1159,7 @@ pub async fn temperature_series(
     let id_err = id.clone();
     let result =
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
-            let files = match store
-                .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))?
-            {
+            let files = match store.find_drive_files_cached(&id)? {
                 Some((_idx, f)) => f,
                 None => return Ok(None),
             };
@@ -1233,9 +1239,7 @@ pub async fn battery_series(
     let id_err = id.clone();
     let result =
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<serde_json::Value>> {
-            let files = match store
-                .with_route_summaries(|summaries| grouper::find_drive_files(summaries, &id))?
-            {
+            let files = match store.find_drive_files_cached(&id)? {
                 Some((_idx, f)) => f,
                 None => return Ok(None),
             };

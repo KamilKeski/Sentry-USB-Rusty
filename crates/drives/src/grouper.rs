@@ -477,6 +477,157 @@ pub fn resolve_drive_selection(summaries: &[RouteSummary], id: &str,
     Some(DriveSelection {index,files,clip_spans_ms,summary:build_summary_from_aggregates(clips,index,tags)})
 }
 
+/// Drive membership from one grouping pass, owned so it can be cached per
+/// route-source revision and reused across drive-detail requests. Reading
+/// every route summary is the expensive part of resolving a drive id (each
+/// row's later columns sit past its point BLOBs); with this index a request
+/// only reads the summaries of the drive's own clips.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DriveIndex {
+    drives: Vec<IndexedDrive>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IndexedDrive {
+    /// Canonical start time, the drive_tags key (`%Y-%m-%dT%H:%M:%S%.3f`).
+    key: String,
+    clips: Vec<IndexedClip>,
+}
+
+/// One `SubClipSummary` without its borrowed summary row.
+#[derive(Debug, Clone, PartialEq)]
+struct IndexedClip {
+    file: String,
+    timestamp: NaiveDateTime,
+    start_frame: u32,
+    end_frame: u32,
+    total_frames: u32,
+    clip_span_ms: i64,
+    fraction: f64,
+}
+
+/// How a drive id resolves against a [`DriveIndex`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexedId {
+    Found(usize),
+    /// No drive has that id (numeric out of range, or several drives share
+    /// the start time).
+    Missing,
+    /// No current drive starts at that time; only the legacy regrouping
+    /// can say whether it names an older second-precision id.
+    NeedsLegacy,
+}
+
+impl DriveIndex {
+    pub fn build(summaries: &[RouteSummary]) -> Self {
+        let drives = group_summary_clips(summaries)
+            .iter()
+            .filter_map(|group| {
+                let first = group.first()?;
+                Some(IndexedDrive {
+                    key: first.timestamp.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
+                    clips: group
+                        .iter()
+                        .map(|clip| IndexedClip {
+                            file: clip.summary.file.clone(),
+                            timestamp: clip.timestamp,
+                            start_frame: clip.start_frame,
+                            end_frame: clip.end_frame,
+                            total_frames: clip.total_frames,
+                            clip_span_ms: clip.clip_span_ms,
+                            fraction: clip.fraction,
+                        })
+                        .collect(),
+                })
+            })
+            .collect();
+        DriveIndex { drives }
+    }
+
+    pub fn len(&self) -> usize {
+        self.drives.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.drives.is_empty()
+    }
+
+    /// Same rules as the full resolver for current ids: a numeric index, or
+    /// the start time of exactly one drive.
+    pub fn resolve(&self, id: &str) -> IndexedId {
+        if let Ok(index) = id.parse::<usize>() {
+            return if index < self.drives.len() { IndexedId::Found(index) } else { IndexedId::Missing };
+        }
+        let mut matches = self.drives.iter().enumerate().filter(|(_, d)| d.key == id).map(|(i, _)| i);
+        match (matches.next(), matches.next()) {
+            (Some(index), None) => IndexedId::Found(index),
+            (Some(_), Some(_)) => IndexedId::Missing,
+            (None, _) => IndexedId::NeedsLegacy,
+        }
+    }
+
+    /// The drive's clip files, first occurrence order, without repeats.
+    pub fn files(&self, index: usize) -> Option<Vec<String>> {
+        let mut seen = std::collections::HashSet::new();
+        Some(
+            self.drives
+                .get(index)?
+                .clips
+                .iter()
+                .filter(|clip| seen.insert(clip.file.as_str()))
+                .map(|clip| clip.file.clone())
+                .collect(),
+        )
+    }
+
+    /// The drive's canonical start time (the drive_tags key).
+    pub fn start_key(&self, index: usize) -> Option<&str> {
+        self.drives.get(index).map(|d| d.key.as_str())
+    }
+
+    /// The selection `resolve_drive_selection` returns, built from the
+    /// summaries of just this drive's files. None if any is missing (the
+    /// routes changed after the index was built).
+    pub fn selection(
+        &self,
+        index: usize,
+        summaries: &[RouteSummary],
+        tags: &HashMap<String, Vec<String>>,
+    ) -> Option<DriveSelection> {
+        let drive = self.drives.get(index)?;
+        let by_file: HashMap<&str, &RouteSummary> =
+            summaries.iter().map(|s| (s.file.as_str(), s)).collect();
+        let clips = drive
+            .clips
+            .iter()
+            .map(|clip| {
+                Some(SubClipSummary {
+                    summary: by_file.get(clip.file.as_str())?,
+                    timestamp: clip.timestamp,
+                    start_frame: clip.start_frame,
+                    clip_span_ms: clip.clip_span_ms,
+                    end_frame: clip.end_frame,
+                    total_frames: clip.total_frames,
+                    fraction: clip.fraction,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let mut files = Vec::new();
+        let mut clip_spans_ms = HashMap::new();
+        for clip in &clips {
+            if clip_spans_ms.insert(clip.summary.file.clone(), clip.clip_span_ms).is_none() {
+                files.push(clip.summary.file.clone());
+            }
+        }
+        Some(DriveSelection {
+            index,
+            files,
+            clip_spans_ms,
+            summary: build_summary_from_aggregates(&clips, index, tags),
+        })
+    }
+}
+
 fn resolve_group_index(summaries:&[RouteSummary], groups:&[Vec<SubClipSummary<'_>>],
     id:&str, exact_legacy_membership:bool)->Option<usize> {
     if let Ok(index)=id.parse::<usize>() {return (index<groups.len()).then_some(index)}
