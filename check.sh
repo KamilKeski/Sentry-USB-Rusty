@@ -24,4 +24,5 @@ shellcheck --exclude=SC1091 \
            ./run/waitforidle \
            ./test/install-pi-safety.test.sh \
            ./test/sentryusb-pick-binary.test.sh \
-           ./test/ble-setup-recovery.test.sh
+           ./test/ble-setup-recovery.test.sh \
+           ./test/live-activity-processing.test.sh

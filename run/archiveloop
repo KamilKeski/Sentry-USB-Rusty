@@ -1715,6 +1715,7 @@ function archive_teslacam_clips () {
     else
       ARCHIVE_TOTAL_COUNT=$total_count /root/bin/send-push-message "$NOTIFICATION_TITLE:" "$message" start archive_start "$(archive_start_summary "$total_count" "$prior_done" "$resume_total")" || log "failed to send mobile app notification"
       /root/bin/send-live-activity start "$total_count" || true
+      LIVE_ACTIVITY_ACTIVE=1
     fi
 
     # setup trigger files
@@ -1865,10 +1866,11 @@ function archive_teslacam_clips () {
       if [[ "$archive_success" == false ]]; then notification_category=archive_error; fi
       /root/bin/send-push-message "$NOTIFICATION_TITLE:" "${message}" finish "$notification_category" \
         "$(archive_finish_summary "$archive_success" "$total_count" "$((sentry_archived + trackmode_archived))" "$delta")"
-      # Live activity: only end what was started — retry attempts never
-      # sent a start, so an end here would be unmatched.
-      if [ "${ARCHIVE_RETRY_ATTEMPT:-0}" != "1" ]; then
-        /root/bin/send-live-activity end complete || true
+      # Live activity: the copy is done but the cycle isn't. Keep it up
+      # through drive processing ("Preparing…" until the processor has a
+      # count); archive_clips ends it once processing and upload finish.
+      if [ "${LIVE_ACTIVITY_ACTIVE:-0}" = "1" ]; then
+        /root/bin/send-live-activity update processing 0 0 0 || true
       fi
     fi
 
@@ -2127,6 +2129,9 @@ function archive_clips () {
   # in the post-archive extras (music, processing, cloud) don't count —
   # only clips left behind by a broken uplink justify a rapid retry.
   local clips_ok=true
+  # Set by archive_teslacam_clips when it starts this cycle's Live Activity;
+  # post-archive-process.sh sends processing progress only for that one.
+  export LIVE_ACTIVITY_ACTIVE=0
 
   if ! archive_run_command /root/bin/connect-archive.sh
   then
@@ -2164,6 +2169,11 @@ function archive_clips () {
     touch /tmp/flag_post_archive
     clear_archive_status
     /root/bin/disconnect-archive.sh 2>> "$LOG_FILE" || true
+    # Processing is skipped, so end the Live Activity here (same pairing
+    # rule as the final end below).
+    if [ "${ARCHIVE_RETRY_ATTEMPT:-0}" != "1" ]; then
+      /root/bin/send-live-activity end complete || true
+    fi
     # In Travel Mode this is the uplink dropping mid-archive (the "Starlink
     # under a bridge" case) — report failure so fast retry can kick in.
     return 1

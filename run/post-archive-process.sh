@@ -173,6 +173,28 @@ fi
 # runs, but the status file may not have been cleaned up yet.
 rm -f /tmp/archive_status.json /tmp/archive_status.json.tmp
 
+# Live Activity progress, only for the activity archiveloop started this
+# cycle (LIVE_ACTIVITY_ACTIVE=1). Sent when the counts change, at most every
+# ACTIVITY_MIN_GAP seconds, plus a heartbeat that keeps the ETA fresh.
+# Total 0 = the processor hasn't counted yet (the widget shows "Preparing…").
+ACTIVITY_MIN_GAP=5
+ACTIVITY_HEARTBEAT=30
+activity_last_sent=0
+activity_last_counts=""
+function send_processing_activity() {
+  [ "${LIVE_ACTIVITY_ACTIVE:-0}" = "1" ] || return 0
+  local current="$1" total="$2" eta="$3" now
+  now=$(date +%s)
+  local since=$((now - activity_last_sent))
+  if [ "$current $total" = "$activity_last_counts" ] && [ "$since" -lt "$ACTIVITY_HEARTBEAT" ]; then
+    return 0
+  fi
+  [ "$since" -ge "$ACTIVITY_MIN_GAP" ] || return 0
+  /root/bin/send-live-activity update processing "$current" "$total" "$eta" || true
+  activity_last_sent=$now
+  activity_last_counts="$current $total"
+}
+
 # Process a single clips directory: trigger API, wait for completion
 function process_clips_dir() {
   local clips_dir="$1"
@@ -215,7 +237,7 @@ function process_clips_dir() {
 
   local timeout=1800
   local elapsed=0
-  local poll_interval=10
+  local poll_interval=5
   local last_progress_log=0
 
   while [ $elapsed -lt $timeout ]; do
@@ -229,11 +251,9 @@ function process_clips_dir() {
     fi
 
     RUNNING=$(echo "$STATUS" | grep -o '"running":true' || true)
-    if [ $((elapsed % 30)) -eq 0 ]; then
-      local activity_current activity_total activity_eta
-      read -r activity_current activity_total activity_eta < <(printf '%s' "$STATUS" | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s.get("process_current",0),s.get("process_total",0),s.get("process_eta_seconds") or 0)')
-      /root/bin/send-live-activity update processing "${activity_current:-0}" "${activity_total:-0}" "${activity_eta:-0}" || true
-    fi
+    local activity_current activity_total activity_eta
+    read -r activity_current activity_total activity_eta < <(printf '%s' "$STATUS" | python3 -c 'import json,sys; s=json.load(sys.stdin); print(s.get("process_current",0),s.get("process_total",0),s.get("process_eta_seconds") or 0)' 2>/dev/null || true)
+    send_processing_activity "${activity_current:-0}" "${activity_total:-0}" "${activity_eta:-0}"
     if echo "$STATUS" | python3 -c 'import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get("running") is False and s.get("archive_work_running") is False and not s.get("error") else 1)'; then
       ROUTES=$(echo "$STATUS" | grep -o '"routes_count":[0-9]*' | cut -d: -f2)
       PROCESSED=$(echo "$STATUS" | grep -o '"processed_count":[0-9]*' | cut -d: -f2)
