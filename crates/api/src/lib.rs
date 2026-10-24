@@ -41,6 +41,7 @@ pub mod cloud;
 pub mod snapshots;
 pub mod keep_accessory;
 pub mod charging;
+pub mod climate;
 pub mod storage_repair;
 pub mod profile;
 pub mod wifi_firmware;

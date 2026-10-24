@@ -593,6 +593,56 @@ pub async fn speedtest(State(_s): State<AppState>) -> impl IntoResponse {
     )
 }
 
+/// Upload speedtests stop counting past this many bytes.
+const SPEEDTEST_UPLOAD_MAX_BYTES: u64 = 1 << 30;
+
+/// POST /api/system/speedtest/upload counts and discards the request body
+/// as it streams in (nothing is buffered), replying `{"bytes", "ms"}`.
+/// Clients run several in parallel, like the download test.
+pub async fn speedtest_upload(body: axum::body::Body) -> impl IntoResponse {
+    use futures_util::StreamExt;
+
+    let started = std::time::Instant::now();
+    let mut bytes: u64 = 0;
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        match chunk {
+            Ok(chunk) => {
+                bytes += chunk.len() as u64;
+                if bytes > SPEEDTEST_UPLOAD_MAX_BYTES {
+                    return crate::json_error(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "speedtest upload is limited to 1 GiB",
+                    );
+                }
+            }
+            Err(e) => {
+                return crate::json_error(
+                    StatusCode::BAD_REQUEST,
+                    &format!("speedtest upload interrupted: {e}"),
+                );
+            }
+        }
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "bytes": bytes,
+            "ms": started.elapsed().as_millis() as u64,
+        })),
+    )
+}
+
+/// GET /api/system/ping answers immediately with a tiny uncached body for
+/// latency and jitter measurement.
+pub async fn ping() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({ "ok": true })),
+    )
+}
+
 /// GET /api/system/rtc-status
 pub async fn get_rtc_status(State(_s): State<AppState>) -> impl IntoResponse {
     let rtc_exists = std::path::Path::new("/dev/rtc0").exists();

@@ -7,15 +7,18 @@
 //! * `set_sentry_mode`       → INFOTAINMENT. Used by SENTRY_CASE=1
 //!                             (auto-arm away) and =3 (periodic nudge).
 //! * `charge_port_open/close` → INFOTAINMENT, ChargePortDoor{Open,Close}.
+//! * `set_climate` / `set_climate_temp` → INFOTAINMENT, HvacAutoAction /
+//!                             HvacTemperatureAdjustmentAction.
 
 use anyhow::{Result, bail};
 use prost::Message;
 
 use crate::proto::car_server::{
     Action, ChargePortDoorClose, ChargePortDoorOpen, ChargingSetLimitAction,
-    ChargingStartStopAction, SetChargingAmpsAction, SetKeepAccessoryPowerModeAction,
+    ChargingStartStopAction, HvacAutoAction, HvacTemperatureAdjustmentAction, SetChargingAmpsAction,
+    SetKeepAccessoryPowerModeAction,
     VehicleAction, VehicleControlSetSentryModeAction, Void, action, charging_start_stop_action,
-    vehicle_action,
+    hvac_temperature_adjustment_action, vehicle_action,
 };
 use crate::proto::vcsec::{UnsignedMessage, unsigned_message};
 use crate::proto::universal_message::Domain;
@@ -217,6 +220,62 @@ mod tests {
         assert!(parse_verb("set-charge-limit:101").is_err());
         assert!(parse_verb("set-charging-amps:not-a-number").is_err());
     }
+
+    #[test]
+    fn climate_power_encodes_auto_action_without_override() {
+        let vehicle_action::VehicleActionMsg::HvacAutoAction(on) =
+            decode_vehicle_action(parse_verb("climate-on").unwrap())
+        else {
+            panic!("expected HvacAutoAction");
+        };
+        assert!(on.power_on);
+        assert!(!on.manual_override);
+
+        let vehicle_action::VehicleActionMsg::HvacAutoAction(off) =
+            decode_vehicle_action(parse_verb("climate-off").unwrap())
+        else {
+            panic!("expected HvacAutoAction");
+        };
+        assert!(!off.power_on);
+        assert!(!off.manual_override);
+    }
+
+    #[test]
+    fn climate_temp_sets_both_front_zones() {
+        let vehicle_action::VehicleActionMsg::HvacTemperatureAdjustmentAction(temp) =
+            decode_vehicle_action(parse_verb("climate-set-temp:21.5").unwrap())
+        else {
+            panic!("expected HvacTemperatureAdjustmentAction");
+        };
+        assert_eq!(temp.driver_temp_celsius, 21.5);
+        assert_eq!(temp.passenger_temp_celsius, 21.5);
+        assert!(matches!(
+            temp.level.and_then(|l| l.r#type),
+            Some(hvac_temperature_adjustment_action::temperature::Type::TempMax(_))
+        ));
+    }
+
+    #[test]
+    fn climate_temp_verb_validates_range_and_precision() {
+        assert!(parse_verb("climate-set-temp:15").is_ok());
+        assert!(parse_verb("climate-set-temp:28.0").is_ok());
+        assert!(parse_verb("climate-set-temp:14.9").is_err());
+        assert!(parse_verb("climate-set-temp:28.1").is_err());
+        assert!(parse_verb("climate-set-temp:21.25").is_err());
+        assert!(parse_verb("climate-set-temp:2.15e1").is_err());
+        assert!(parse_verb("climate-set-temp:NaN").is_err());
+        assert!(parse_verb("climate-set-temp:").is_err());
+    }
+
+    #[test]
+    fn only_user_commands_wake_the_car_first() {
+        assert!(wakes_car_first("set-charge-limit:80"));
+        assert!(wakes_car_first("climate-on"));
+        assert!(wakes_car_first("climate-set-temp:21"));
+        assert!(!wakes_car_first("wake"));
+        assert!(!wakes_car_first("sentry-on"));
+        assert!(!wakes_car_first("keep-accessory-on"));
+    }
 }
 
 fn charging_start_stop(
@@ -279,6 +338,78 @@ pub fn set_charge_limit(percent: i32) -> ActionPayload {
     }
 }
 
+/// Turn cabin climate on or off. `manual_override` stays false so the car
+/// treats it like the Tesla app's climate button.
+pub fn set_climate(power_on: bool) -> ActionPayload {
+    let action = Action {
+        action_msg: Some(action::ActionMsg::VehicleAction(VehicleAction {
+            vehicle_action_msg: Some(vehicle_action::VehicleActionMsg::HvacAutoAction(
+                HvacAutoAction {
+                    power_on,
+                    manual_override: false,
+                },
+            )),
+        })),
+    };
+    ActionPayload {
+        domain: Domain::Infotainment,
+        inner: action.encode_to_vec(),
+    }
+}
+
+/// Set the driver and passenger setpoints to the same temperature. `level`
+/// is TEMP_MAX as in the official SDK's `ChangeClimateTemp`.
+pub fn set_climate_temp(celsius: f32) -> ActionPayload {
+    let action = Action {
+        action_msg: Some(action::ActionMsg::VehicleAction(VehicleAction {
+            vehicle_action_msg: Some(
+                vehicle_action::VehicleActionMsg::HvacTemperatureAdjustmentAction(
+                    HvacTemperatureAdjustmentAction {
+                        driver_temp_celsius: celsius,
+                        passenger_temp_celsius: celsius,
+                        level: Some(hvac_temperature_adjustment_action::Temperature {
+                            r#type: Some(
+                                hvac_temperature_adjustment_action::temperature::Type::TempMax(
+                                    Void {},
+                                ),
+                            ),
+                        }),
+                        ..Default::default()
+                    },
+                ),
+            ),
+        })),
+    };
+    ActionPayload {
+        domain: Domain::Infotainment,
+        inner: action.encode_to_vec(),
+    }
+}
+
+/// Parse a climate setpoint: 15.0–28.0 °C with at most one decimal place.
+fn parse_climate_celsius(raw: &str) -> Result<f32> {
+    let decimals = raw.split_once('.').map_or(0, |(_, frac)| frac.len());
+    let celsius: f32 = raw
+        .parse()
+        .ok()
+        .filter(|c: &f32| c.is_finite() && decimals <= 1)
+        .ok_or_else(|| anyhow::anyhow!("climate temperature must be a number with at most one decimal"))?;
+    if !(15.0..=28.0).contains(&celsius) {
+        bail!("climate temperature must be between 15.0 and 28.0 °C");
+    }
+    Ok(celsius)
+}
+
+/// User-initiated commands that should reach a sleeping car: the sender
+/// wakes it first (see `PersistentSession::send_action_waking`). Keep-awake
+/// verbs are excluded because their callers already sequence `wake`.
+pub fn wakes_car_first(verb: &str) -> bool {
+    matches!(verb, "charge-start" | "charge-stop" | "climate-on" | "climate-off")
+        || verb.starts_with("set-charging-amps:")
+        || verb.starts_with("set-charge-limit:")
+        || verb.starts_with("climate-set-temp:")
+}
+
 /// Translate the CLI/IPC wire verb into a typed action. Parameterized
 /// values use a single colon-delimited argument so the daemon's one-line
 /// socket protocol remains unchanged.
@@ -293,6 +424,8 @@ pub fn parse_verb(verb: &str) -> Result<ActionPayload> {
         "keep-accessory-off" => Ok(set_keep_accessory_power(false)),
         "charge-start" => Ok(start_charging()),
         "charge-stop" => Ok(stop_charging()),
+        "climate-on" => Ok(set_climate(true)),
+        "climate-off" => Ok(set_climate(false)),
         other => {
             if let Some(raw) = other.strip_prefix("set-charging-amps:") {
                 let amps: i32 = raw
@@ -311,6 +444,9 @@ pub fn parse_verb(verb: &str) -> Result<ActionPayload> {
                     bail!("charge limit must be between 50 and 100");
                 }
                 return Ok(set_charge_limit(percent));
+            }
+            if let Some(raw) = other.strip_prefix("climate-set-temp:") {
+                return Ok(set_climate_temp(parse_climate_celsius(raw)?));
             }
             bail!("unknown BLE action verb '{other}'")
         }

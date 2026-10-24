@@ -36,6 +36,9 @@
 //!   charge-stop        - stop charging
 //!   set-charging-amps:N - set charging current (1-80 A)
 //!   set-charge-limit:N  - set charge limit (50-100%)
+//!   climate-on         - turn cabin climate on
+//!   climate-off        - turn cabin climate off
+//!   climate-set-temp:C - set driver+passenger temperature (15.0-28.0 C)
 //!   keep-accessory-on  - turn Keep Accessory Power on
 //!   keep-accessory-off - turn Keep Accessory Power off
 //!   session-info       - pairing probe (see below)
@@ -101,7 +104,7 @@ async fn main() -> ExitCode {
         Some(v) => v,
         None => {
             eprintln!(
-                "usage: sentryusb-ble-action <wake|sentry-on|sentry-off|charge-port-open|charge-port-close|keep-accessory-on|keep-accessory-off|charge-start|charge-stop|set-charging-amps:N|set-charge-limit:N|session-info|drive-state|sentry-state|pair|pair-driver|keygen>"
+                "usage: sentryusb-ble-action <wake|sentry-on|sentry-off|charge-port-open|charge-port-close|keep-accessory-on|keep-accessory-off|charge-start|charge-stop|set-charging-amps:N|set-charge-limit:N|climate-on|climate-off|climate-set-temp:C|session-info|drive-state|sentry-state|pair|pair-driver|keygen>"
             );
             return ExitCode::from(1);
         }
@@ -668,12 +671,16 @@ async fn run(verb: &str, action: ActionPayload) -> Result<()> {
 
     // One-shot — wrap in an outer timeout so the script doesn't hang
     // indefinitely if the car never advertises.
-    let resp = tokio::time::timeout(
-        Duration::from_secs(60),
-        session.send_action(action),
-    )
-    .await
-    .context("BLE action timed out after 60s")?;
+    let send = async {
+        if actions::wakes_car_first(verb) {
+            session.send_action_waking(action).await
+        } else {
+            session.send_action(action).await
+        }
+    };
+    let resp = tokio::time::timeout(Duration::from_secs(60), send)
+        .await
+        .context("BLE action timed out after 60s")?;
     session.shutdown().await;
 
     match resp {

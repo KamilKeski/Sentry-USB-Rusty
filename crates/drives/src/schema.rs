@@ -135,7 +135,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// (V23_TELEMETRY_TPMS_SEEN_COLUMNS). Parked, the sensors sleep and the car
 /// keeps reporting the old pressure, so the poll time overstates freshness.
 /// Nullable; rows from before v23 (or cars that omit the time) stay NULL.
-pub const CURRENT_SCHEMA_VERSION: i32 = 23;
+/// v23 -> v24: store the climate driver setpoint and the car's allowed
+/// setpoint range (V24_TELEMETRY_CLIMATE_SETPOINT_COLUMNS) for the climate
+/// controls. Nullable; older rows stay NULL.
+pub const CURRENT_SCHEMA_VERSION: i32 = 24;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly â€”
@@ -446,6 +449,14 @@ pub const V23_TELEMETRY_TPMS_SEEN_COLUMNS: &[(&str, &str)] = &[
     ("tire_fr_seen_ts", "INTEGER"),
     ("tire_rl_seen_ts", "INTEGER"),
     ("tire_rr_seen_ts", "INTEGER"),
+];
+
+/// v24 climate setpoint columns, Celsius as reported by the car: the driver
+/// setting and the min/max setpoints the car accepts.
+pub const V24_TELEMETRY_CLIMATE_SETPOINT_COLUMNS: &[(&str, &str)] = &[
+    ("driver_temp_setting_c", "REAL"),
+    ("min_avail_temp_c", "REAL"),
+    ("max_avail_temp_c", "REAL"),
 ];
 
 /// v10 per-clip location-name rollups on `routes`. Populated by
@@ -867,6 +878,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V14_TELEMETRY_CHARGE_PHASE_COLUMN.iter())
         .chain(V17_TELEMETRY_CHARGING_CONTROL_COLUMNS.iter())
         .chain(V23_TELEMETRY_TPMS_SEEN_COLUMNS.iter())
+        .chain(V24_TELEMETRY_CLIMATE_SETPOINT_COLUMNS.iter())
     {
         if existing_tele.contains(*name) {
             continue;
@@ -1077,7 +1089,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23"),
+            Some("24"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -1115,7 +1127,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1147,7 +1159,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1181,7 +1193,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1288,7 +1300,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1339,7 +1351,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1392,7 +1404,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1429,7 +1441,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1467,7 +1479,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1489,7 +1501,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1562,7 +1574,7 @@ mod tests {
         assert_eq!(retained, (73.0, None, None, None));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1601,7 +1613,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1641,7 +1653,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1682,7 +1694,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1742,7 +1754,7 @@ mod tests {
         assert!(ap.is_none(), "pre-v21 rows read as absent, not empty");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 
@@ -1799,7 +1811,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(retained, (1214, None, None));
-        assert_eq!(meta_get(&conn, "schema_version").unwrap().as_deref(), Some("23"));
+        assert_eq!(meta_get(&conn, "schema_version").unwrap().as_deref(), Some("24"));
     }
 
     #[test]
@@ -1830,7 +1842,38 @@ mod tests {
             })
             .unwrap();
         assert_eq!(retained, (41.0, None));
-        assert_eq!(meta_get(&conn, "schema_version").unwrap().as_deref(), Some("23"));
+        assert_eq!(meta_get(&conn, "schema_version").unwrap().as_deref(), Some("24"));
+    }
+
+    #[test]
+    fn migrate_from_v23_adds_v24_climate_setpoint_columns() {
+        let conn = open();
+        migrate(&conn).unwrap();
+        for (name, _) in V24_TELEMETRY_CLIMATE_SETPOINT_COLUMNS {
+            conn.execute(&format!("ALTER TABLE telemetry_samples DROP COLUMN {name}"), [])
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO telemetry_samples(ts, source, hvac_on) VALUES(1700000000, 'state', 1)",
+            [],
+        )
+        .unwrap();
+        meta_set(&conn, "schema_version", "23").unwrap();
+
+        migrate(&conn).unwrap();
+        migrate(&conn).unwrap();
+
+        let cols = list_telemetry_columns(&conn).unwrap();
+        for (name, _) in V24_TELEMETRY_CLIMATE_SETPOINT_COLUMNS {
+            assert!(cols.contains(*name), "telemetry_samples.{name} missing after v24");
+        }
+        let retained: (i64, Option<f64>) = conn
+            .query_row("SELECT hvac_on, driver_temp_setting_c FROM telemetry_samples", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(retained, (1, None));
+        assert_eq!(meta_get(&conn, "schema_version").unwrap().as_deref(), Some("24"));
     }
 
     #[test]
@@ -1872,7 +1915,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("23")
+            Some("24")
         );
     }
 

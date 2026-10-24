@@ -125,6 +125,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/ble-adapter", post(crate::ble::ble_adapter_set))
         .route("/api/system/ble-force-poll", post(crate::ble::ble_force_poll))
         .route("/api/system/speedtest", get(crate::system::speedtest))
+        // The handler streams and caps the body itself.
+        .route(
+            "/api/system/speedtest/upload",
+            post(crate::system::speedtest_upload).layer(DefaultBodyLimit::disable()),
+        )
+        .route("/api/system/ping", get(crate::system::ping))
         .route("/api/system/rtc-status", get(crate::system::get_rtc_status))
         .route("/api/system/clock-status", get(crate::system::get_clock_status))
         .route("/api/system/ssh-pubkey", get(crate::system::get_ssh_pubkey))
@@ -259,6 +265,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/charging/current", get(crate::charging::current_charging))
         .route("/api/charging/rates", get(crate::preferences::rates_editor::get_rates).put(crate::preferences::rates_editor::save_rates))
         .route("/api/charging/action", post(crate::charging::charging_action))
+        .route("/api/climate/action", post(crate::climate::climate_action))
         .route("/api/charging/tags", get(crate::charging::list_charge_tags))
         .route(
             "/api/charging/home-sessions",

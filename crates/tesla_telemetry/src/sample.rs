@@ -159,6 +159,11 @@ pub struct ClimateResult {
     pub interior_temp_c: Option<f64>,
     pub exterior_temp_c: Option<f64>,
     pub hvac_on: Option<bool>,
+    /// Driver setpoint and the car's allowed setpoint range (v24), persisted
+    /// for the climate controls.
+    pub driver_temp_setting_c: Option<f64>,
+    pub min_avail_temp_c: Option<f64>,
+    pub max_avail_temp_c: Option<f64>,
     pub meta: ResponseMeta,
     /// Setpoints / fan / defroster / seat-heater / preconditioning detail.
     /// Decoded only when the experimental flag is on; inert otherwise.
@@ -313,6 +318,11 @@ pub struct Sample {
     pub interior_temp_c: Option<f64>,
     pub exterior_temp_c: Option<f64>,
     pub hvac_on: Option<bool>,
+    // Climate setpoint (v24): driver setting plus the car's min/max allowed
+    // setpoints, Celsius. Feeds the climate controls' temperature picker.
+    pub driver_temp_setting_c: Option<f64>,
+    pub min_avail_temp_c: Option<f64>,
+    pub max_avail_temp_c: Option<f64>,
     // TPMS pressures in PSI. All four optional — cars without TPMS
     // (or runs where the `state tire-pressure` call fails / times
     // out) just leave these as None and the UI hides the row.

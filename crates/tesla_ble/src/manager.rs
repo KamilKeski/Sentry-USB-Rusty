@@ -485,6 +485,70 @@ impl PersistentSession {
         self.send_signed(action.domain, action.inner).await
     }
 
+    /// `send_action` for user commands that must also reach a sleeping car.
+    /// The infotainment computer ignores signed commands while asleep, but
+    /// VCSEC still answers: an asleep body-controller report triggers a
+    /// VCSEC wake, a bounded wait for AWAKE, then the action, retried once
+    /// if it fails early enough to fit the API's 30 s command budget. An
+    /// awake (or unknown) car costs one extra body-controller round-trip.
+    pub async fn send_action_waking(
+        &self,
+        action: crate::actions::ActionPayload,
+    ) -> Result<Vec<u8>> {
+        // VehicleSleepStatus_E (vcsec.proto): 1=AWAKE, 2=ASLEEP.
+        const AWAKE: i32 = 1;
+        const ASLEEP: i32 = 2;
+        const WAKE_WAIT_MAX: Duration = Duration::from_secs(10);
+        const WAKE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+        const RETRY_CUTOFF: Duration = Duration::from_secs(12);
+
+        if action.domain != Domain::Infotainment {
+            return self.send_action(action).await;
+        }
+        let started = Instant::now();
+        let asleep = matches!(
+            self.body_controller_state().await,
+            Ok(status) if status.vehicle_sleep_status == ASLEEP
+        );
+        if !asleep {
+            return self.send_action(action).await;
+        }
+
+        info!("PersistentSession: car asleep — waking it before the command");
+        self.send_action(crate::actions::wake_vehicle())
+            .await
+            .context("waking the car before the command")?;
+        // Proceed after the window either way; the action's own handshake
+        // timeout is the final word on whether infotainment came up.
+        while started.elapsed() < WAKE_WAIT_MAX {
+            sleep(WAKE_POLL_INTERVAL).await;
+            if matches!(
+                self.body_controller_state().await,
+                Ok(status) if status.vehicle_sleep_status == AWAKE
+            ) {
+                break;
+            }
+        }
+        info!(
+            "PersistentSession: wake settled after {}ms; sending the command",
+            started.elapsed().as_millis()
+        );
+
+        let retry = crate::actions::ActionPayload {
+            domain: action.domain,
+            inner: action.inner.clone(),
+        };
+        match self.send_action(action).await {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if started.elapsed() < RETRY_CUTOFF => {
+                warn!("PersistentSession: command after wake failed ({e:#}); retrying once");
+                sleep(WAKE_POLL_INTERVAL).await;
+                self.send_action(retry).await
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Unauthenticated body-controller query over the held connection
     /// (no new scan/connect, no competition with the authenticated
     /// queries). Used by the sampler's Quiet-mode poll — sleep-safe,

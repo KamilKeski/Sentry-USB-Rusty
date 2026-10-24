@@ -12,7 +12,8 @@
 //!   `wake`, `sentry-on`, `sentry-off`, `charge-port-open`,
 //!   `charge-port-close`, `keep-accessory-on`, `keep-accessory-off`,
 //!   `charge-start`, `charge-stop`, `set-charging-amps:<n>`,
-//!   `set-charge-limit:<n>`,
+//!   `set-charge-limit:<n>`, `climate-on`, `climate-off`,
+//!   `climate-set-temp:<celsius>`,
 //!   `session-info`, `drive-state`, `sentry-state`,
 //!   `pair` (Owner), `pair-driver` (experimental Driver).
 //!

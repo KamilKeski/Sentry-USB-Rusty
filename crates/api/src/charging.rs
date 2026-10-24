@@ -38,11 +38,15 @@ pub(crate) fn invalidate_charging_list() {
 }
 
 /// Cache the latest charge row without exceeding the sampler's cadence.
-static LATEST_CHARGE_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), Option<LatestCharge>> =
+static LATEST_CHARGE_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), ChargeSnapshot> =
     crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(10));
 
 /// Vehicle-changing controls reject samples older than two normal polls.
 const CHARGING_CONTROL_FRESH_SECS: i64 = 120;
+
+/// The charge limit only changes on command, so the last reported value is
+/// shown (and adjustable) for this long after it was sampled.
+const KNOWN_LIMIT_MAX_AGE_SECS: i64 = 7 * 86_400;
 
 
 #[derive(Serialize)]
@@ -758,13 +762,16 @@ pub async fn single_charging(
 }
 
 /// Dashboard charge status. Metrics require active charging; control fields
-/// require a fresher active-charge or open-port sample.
+/// require a fresher active-charge or open-port sample. `limit_soc` is the
+/// last known limit whether or not the car is charging, and the limit stays
+/// adjustable whenever it is known and BLE health allows a waking command.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CurrentCharge {
     charging: bool,
     soc: Option<f64>,
     limit_soc: Option<i64>,
+    limit_adjustable: bool,
     power_kw: Option<i64>,
     current_a: Option<i64>,
     voltage_v: Option<i64>,
@@ -785,6 +792,7 @@ impl CurrentCharge {
             charging: false,
             soc: None,
             limit_soc: None,
+            limit_adjustable: false,
             power_kw: None,
             current_a: None,
             voltage_v: None,
@@ -798,6 +806,22 @@ impl CurrentCharge {
             controls_available: false,
             controls_valid_until_ts: None,
         }
+    }
+
+    /// Build the response from a snapshot; `health_ok` is the BLE gate for
+    /// limit changes (`ble::wake_controls_health_is_ok`).
+    fn from_snapshot(snapshot: ChargeSnapshot, health_ok: bool, now: i64) -> Self {
+        let mut cur = Self::from_latest(snapshot.latest, now);
+        // Prefer the live charging row's limit; otherwise the last one sampled.
+        let known_limit = cur.limit_soc.or_else(|| {
+            snapshot
+                .known_limit
+                .filter(|(_, ts)| (0..=KNOWN_LIMIT_MAX_AGE_SECS).contains(&(now - ts)))
+                .map(|(limit, _)| limit)
+        });
+        cur.limit_soc = known_limit;
+        cur.limit_adjustable = health_ok && known_limit.is_some();
+        cur
     }
 
     fn from_latest(latest: Option<LatestCharge>, now: i64) -> Self {
@@ -817,6 +841,7 @@ impl CurrentCharge {
             charging,
             soc,
             limit_soc: if charging { l.limit_soc } else { None },
+            limit_adjustable: false,
             power_kw: if charging { l.power_kw } else { None },
             current_a: if charging {
                 display_current_a(l.power_kw, l.voltage_v, l.current_a)
@@ -871,6 +896,30 @@ impl LatestCharge {
     }
 }
 
+/// Cached `/api/charging/current` inputs: the latest charge row, the most
+/// recent reported charge limit and its sample time, and the newest
+/// authenticated sampler row for the limit's health gate.
+#[derive(Clone, Default)]
+struct ChargeSnapshot {
+    latest: Option<LatestCharge>,
+    known_limit: Option<(i64, i64)>,
+    authenticated_sample_ts: i64,
+}
+
+/// Most recent charge limit and its sample time. The timestamp floor bounds
+/// the reverse scan for cars that never report one.
+fn query_known_limit(conn: &rusqlite::Connection, now: i64) -> rusqlite::Result<Option<(i64, i64)>> {
+    use rusqlite::OptionalExtension;
+    conn.query_row(
+        "SELECT charge_limit_soc, ts FROM telemetry_samples \
+         WHERE charge_limit_soc IS NOT NULL AND ts >= ?1 \
+         ORDER BY ts DESC LIMIT 1",
+        (now - KNOWN_LIMIT_MAX_AGE_SECS,),
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .optional()
+}
+
 fn query_latest_charge(conn: &rusqlite::Connection) -> rusqlite::Result<Option<LatestCharge>> {
     use rusqlite::OptionalExtension;
     conn.query_row(
@@ -917,20 +966,34 @@ pub async fn current_charging(
     // Cache the row rather than response so freshness still uses the current clock
     // and archive-time disk stalls do not queue every poll.
     let store = state.drives.store.clone();
-    let latest = LATEST_CHARGE_CACHE
-        .get((), move || {
-        store.with_read_conn(query_latest_charge)
-        // Failed reads retain the cache; successful empty reads clear it.
-        .ok()
-        })
-        .await
-        .flatten();
-
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default();
-    let cur = CurrentCharge::from_latest(latest, now);
+    let snapshot = LATEST_CHARGE_CACHE
+        .get((), move || {
+        store.with_read_conn(|conn| -> rusqlite::Result<ChargeSnapshot> {
+            Ok(ChargeSnapshot {
+                latest: query_latest_charge(conn)?,
+                known_limit: query_known_limit(conn, now)?,
+                authenticated_sample_ts: crate::ble::latest_authenticated_sample_ts(conn),
+            })
+        })
+        // Failed reads retain the cache; successful empty reads clear it.
+        .ok()
+        })
+        .await
+        .unwrap_or_default();
+
+    // The sampler ts rides in the cached snapshot so polls add no database
+    // read; the health record, radio owner, and clock are checked per request.
+    let sampler_ts = snapshot.authenticated_sample_ts;
+    let health_ok = tokio::task::spawn_blocking(move || {
+        crate::ble::wake_controls_health_is_ok_at(sampler_ts, now)
+    })
+    .await
+    .unwrap_or(false);
+    let cur = CurrentCharge::from_snapshot(snapshot, health_ok, now);
     (StatusCode::OK, Json(serde_json::to_value(cur).unwrap()))
 }
 
@@ -969,6 +1032,27 @@ fn charging_action_verb(
     }
 }
 
+/// Server-side safety gate for a charging action (409 message on refusal).
+/// `health_ok` is the health check matching the action: waking-command
+/// health for setLimit, green for the rest.
+fn charging_action_gate(
+    set_limit: bool,
+    latest: Option<&LatestCharge>,
+    health_ok: bool,
+    now: i64,
+) -> Result<(), &'static str> {
+    if !set_limit && latest.is_none() {
+        return Err("no charging telemetry is available");
+    }
+    if !health_ok {
+        return Err("charging controls require a healthy authenticated BLE connection");
+    }
+    if !set_limit && !latest.is_some_and(|l| l.controls_available(now)) {
+        return Err("charging controls require a fresh open charge port or active charge");
+    }
+    Ok(())
+}
+
 /// POST /api/charging/action, enforcing the UI safety gate server-side.
 pub async fn charging_action(
     State(state): State<AppState>,
@@ -978,21 +1062,24 @@ pub async fn charging_action(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default();
+    // The charge limit is settable any time (the sender wakes a sleeping
+    // car), so it skips the fresh-telemetry gate and uses the waking-command
+    // health gate; start/stop/amps still need a fresh open port or charge.
+    let set_limit = req.action == "setLimit";
     let store = state.drives.store.clone();
-    let (latest, health_is_green) = match tokio::task::spawn_blocking(move || {
+    let (latest, health_ok) = match tokio::task::spawn_blocking(move || {
         store.with_read_conn(|conn| -> rusqlite::Result<(Option<LatestCharge>, bool)> {
-            Ok((
-                query_latest_charge(conn)?,
-                crate::ble::charging_controls_health_is_green(conn, now),
-            ))
+            let health_ok = if set_limit {
+                crate::ble::wake_controls_health_is_ok(conn, now)
+            } else {
+                crate::ble::charging_controls_health_is_green(conn, now)
+            };
+            Ok((query_latest_charge(conn)?, health_ok))
         })
     })
     .await
     {
-        Ok(Ok((Some(latest), health_is_green))) => (latest, health_is_green),
-        Ok(Ok((None, _))) => {
-            return crate::json_error(StatusCode::CONFLICT, "no charging telemetry is available");
-        }
+        Ok(Ok(read)) => read,
         Ok(Err(e)) => {
             return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging telemetry read failed: {e}"));
         }
@@ -1000,19 +1087,11 @@ pub async fn charging_action(
             return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("charging telemetry task failed: {e}"));
         }
     };
-    if !health_is_green {
-        return crate::json_error(
-            StatusCode::CONFLICT,
-            "charging controls require a healthy authenticated BLE connection",
-        );
+    if let Err(message) = charging_action_gate(set_limit, latest.as_ref(), health_ok, now) {
+        return crate::json_error(StatusCode::CONFLICT, message);
     }
-    if !latest.controls_available(now) {
-        return crate::json_error(
-            StatusCode::CONFLICT,
-            "charging controls require a fresh open charge port or active charge",
-        );
-    }
-    let verb = match charging_action_verb(&req, latest.charge_current_request_max) {
+    let max_amps = latest.as_ref().and_then(|l| l.charge_current_request_max);
+    let verb = match charging_action_verb(&req, max_amps) {
         Ok(verb) => verb,
         Err(message) => return crate::json_error(StatusCode::BAD_REQUEST, &message),
     };
@@ -1488,6 +1567,95 @@ mod tests {
             );
         }
         assert_eq!(value["controlsAvailable"], false);
+        assert_eq!(value["limitSoc"], serde_json::Value::Null);
+        assert_eq!(value["limitAdjustable"], false);
+    }
+
+    /// A parked, port-closed row with the given limit; nothing is charging.
+    fn parked_latest(ts: i64, limit_soc: Option<i64>) -> LatestCharge {
+        LatestCharge {
+            ts,
+            soc: Some(64.0),
+            limit_soc,
+            power_kw: Some(0),
+            current_a: Some(0),
+            voltage_v: Some(0),
+            rate_mph: Some(0.0),
+            energy_added_kwh: None,
+            minutes_to_full: None,
+            range_mi: Some(172.0),
+            charging_state: Some("disconnected".into()),
+            charging_amps_set: Some(32),
+            charge_current_request_max: Some(48),
+            charge_port_door_open: Some(false),
+        }
+    }
+
+    #[test]
+    fn known_limit_is_reported_and_adjustable_while_not_charging() {
+        let now = 10_000_000;
+        let snapshot = ChargeSnapshot {
+            latest: Some(parked_latest(now - 4_000, None)),
+            known_limit: Some((80, now - 3 * 86_400)),
+            ..Default::default()
+        };
+        let value =
+            serde_json::to_value(CurrentCharge::from_snapshot(snapshot.clone(), true, now)).unwrap();
+        assert_eq!(value["charging"], false);
+        assert_eq!(value["limitSoc"], 80);
+        assert_eq!(value["limitAdjustable"], true);
+        // Start/stop/amps stay behind the fresh open-port gate.
+        assert_eq!(value["controlsAvailable"], false);
+
+        let unhealthy =
+            serde_json::to_value(CurrentCharge::from_snapshot(snapshot, false, now)).unwrap();
+        assert_eq!(unhealthy["limitSoc"], 80);
+        assert_eq!(unhealthy["limitAdjustable"], false);
+    }
+
+    #[test]
+    fn limit_needs_a_sample_from_the_last_week_and_prefers_the_live_charge() {
+        let now = 10_000_000;
+        let stale = ChargeSnapshot {
+            latest: None,
+            known_limit: Some((80, now - 8 * 86_400)),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(CurrentCharge::from_snapshot(stale, true, now)).unwrap();
+        assert_eq!(value["limitSoc"], serde_json::Value::Null);
+        assert_eq!(value["limitAdjustable"], false);
+
+        // No charge row at all still reports a recent limit.
+        let no_row = ChargeSnapshot { latest: None, known_limit: Some((75, now - 60)), ..Default::default() };
+        let value = serde_json::to_value(CurrentCharge::from_snapshot(no_row, true, now)).unwrap();
+        assert_eq!(value["limitSoc"], 75);
+        assert_eq!(value["limitAdjustable"], true);
+
+        let mut charging = parked_latest(now - 30, Some(90));
+        charging.charging_state = Some("charging".into());
+        charging.charge_port_door_open = Some(true);
+        let live = ChargeSnapshot { latest: Some(charging), known_limit: Some((80, now - 600)), ..Default::default() };
+        let value = serde_json::to_value(CurrentCharge::from_snapshot(live, true, now)).unwrap();
+        assert_eq!(value["charging"], true);
+        assert_eq!(value["limitSoc"], 90);
+    }
+
+    #[test]
+    fn set_limit_skips_the_fresh_telemetry_gate_but_not_health() {
+        let now = 10_000_000;
+        let parked = parked_latest(now - 4_000, Some(80));
+        assert!(charging_action_gate(true, Some(&parked), true, now).is_ok());
+        assert!(charging_action_gate(true, None, true, now).is_ok());
+        assert!(charging_action_gate(true, Some(&parked), false, now).is_err());
+
+        // start, stop, and setAmps share the fresh open-port/charge gate.
+        assert!(charging_action_gate(false, Some(&parked), true, now).is_err());
+        assert!(charging_action_gate(false, None, true, now).is_err());
+        let mut open_port = parked.clone();
+        open_port.ts = now - 30;
+        open_port.charge_port_door_open = Some(true);
+        assert!(charging_action_gate(false, Some(&open_port), true, now).is_ok());
+        assert!(charging_action_gate(false, Some(&open_port), false, now).is_err());
     }
 
     #[test]

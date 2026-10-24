@@ -499,6 +499,67 @@ pub(crate) fn charging_controls_health_is_green(
     )
 }
 
+/// Like `ble_health_allows_controls`, for commands whose sender wakes the
+/// car itself (charge limit, climate). Green needs an authenticated reply
+/// within 60 s, which a parked car polled every 180 s, or a sleeping one,
+/// rarely has; this also accepts the quiet "delayed"/"idle" states once the
+/// car has answered at least once. Faults, re-pair, and keep-awake/archive
+/// radio pauses still block.
+fn ble_health_allows_wake_controls(
+    enabled: bool,
+    record: Option<HealthRecord>,
+    last_authenticated_success_ts: i64,
+    radio_owner: Option<&str>,
+    archiving: bool,
+    now_ts: i64,
+) -> bool {
+    if !enabled || last_authenticated_success_ts <= 0 {
+        return false;
+    }
+    let health = classify_health(&HealthInput {
+        record,
+        last_authenticated_success_ts,
+        radio_owner,
+        archiving,
+        now_ts,
+    });
+    health.severity == Severity::Green || matches!(health.code, "delayed" | "idle")
+}
+
+/// Server-side health gate for the charge limit and climate controls.
+pub(crate) fn wake_controls_health_is_ok(conn: &rusqlite::Connection, now_ts: i64) -> bool {
+    wake_controls_health_is_ok_at(latest_authenticated_sample_ts(conn), now_ts)
+}
+
+/// Newest authenticated sampler row, for callers that cache it alongside
+/// other telemetry reads and evaluate `wake_controls_health_is_ok_at` later.
+pub(crate) fn latest_authenticated_sample_ts(conn: &rusqlite::Connection) -> i64 {
+    authenticated_activity(conn, i64::MAX).0
+}
+
+/// `wake_controls_health_is_ok` given the sampler's newest authenticated
+/// row ts; reads only the health record and radio owner files.
+pub(crate) fn wake_controls_health_is_ok_at(sampler_ts: i64, now_ts: i64) -> bool {
+    let probe_ts = LAST_BLE_SUCCESS_TS.load(Ordering::Relaxed);
+    let last_authenticated_success_ts = probe_ts.max(sampler_ts);
+    let record = match read_at(std::path::Path::new(DEFAULT_HEALTH_PATH)) {
+        Ok(record) => record,
+        Err(e) => {
+            tracing::warn!("could not read BLE health record for vehicle controls: {e}");
+            return false;
+        }
+    };
+    let radio_owner = read_radio_owner();
+    ble_health_allows_wake_controls(
+        is_ble_enabled(),
+        record,
+        last_authenticated_success_ts,
+        radio_owner.as_deref(),
+        crate::drives_handler::is_archiving(),
+        now_ts,
+    )
+}
+
 pub async fn ble_connected(
     State(s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -653,11 +714,20 @@ type LatestSample = (
     Option<f64>,          // latitude
     Option<f64>,          // longitude
     Option<i64>,          // body_controller ts
+    ClimateSetpoint,
 );
+
+/// Driver setpoint plus the car's min/max allowed setpoints, Celsius.
+type ClimateSetpoint = (Option<f64>, Option<f64>, Option<f64>);
 
 /// Cache below the sampler cadence to limit database reads from panel polling.
 static LATEST_SAMPLE_CACHE: crate::ttl_cache::StaleWhileRevalidate<(), Option<LatestSample>> =
     crate::ttl_cache::StaleWhileRevalidate::new(std::time::Duration::from_secs(10));
+
+/// Drop the cached sample so the next read reflects a just-sent command.
+pub(crate) fn invalidate_latest_sample() {
+    LATEST_SAMPLE_CACHE.clear();
+}
 
 /// A tire's latest pressure and the time it was measured. Parked, TPMS
 /// sensors sleep and the car keeps reporting the last pressure it heard, so
@@ -813,6 +883,11 @@ pub(crate) async fn latest_car_sample(s: &AppState) -> Option<serde_json::Value>
                     latest_col_f64("latitude"),
                     latest_col_f64("longitude"),
                     body_controller_ts,
+                    (
+                        latest_col_f64("driver_temp_setting_c"),
+                        latest_col_f64("min_avail_temp_c"),
+                        latest_col_f64("max_avail_temp_c"),
+                    ),
                 )
             })
         }))
@@ -846,6 +921,7 @@ pub(crate) async fn latest_car_sample(s: &AppState) -> Option<serde_json::Value>
             latitude,
             longitude,
             body_controller_ts,
+            (driver_temp_setting_c, min_avail_temp_c, max_avail_temp_c),
         )) => {
             // Return only a derived at-home boolean. Read the uncached geofence
             // only when a fix exists so moves apply on the next request.
@@ -863,6 +939,9 @@ pub(crate) async fn latest_car_sample(s: &AppState) -> Option<serde_json::Value>
                 "interior_temp_c": interior_temp_c.map(|(v, _)| v),
                 "exterior_temp_c": exterior_temp_c.map(|(v, _)| v),
                 "hvac_on": hvac_on.map(|v| v != 0),
+                "driver_temp_setting_c": driver_temp_setting_c,
+                "min_avail_temp_c": min_avail_temp_c,
+                "max_avail_temp_c": max_avail_temp_c,
                 "tire_fl_psi": tire_fl_psi.map(|(v, _)| v),
                 "tire_fr_psi": tire_fr_psi.map(|(v, _)| v),
                 "tire_rl_psi": tire_rl_psi.map(|(v, _)| v),
@@ -1199,6 +1278,47 @@ mod tests {
             None,
             false,
             1_040,
+        ));
+    }
+
+    #[test]
+    fn wake_controls_accept_a_quiet_car_but_not_faults_or_pauses() {
+        // Green, delayed (parked-awake cadence), and idle (asleep) all pass.
+        assert!(ble_health_allows_wake_controls(true, None, 1_000, None, false, 1_030));
+        assert!(ble_health_allows_wake_controls(true, None, 1_000, None, false, 1_300));
+        assert!(ble_health_allows_wake_controls(true, None, 1_000, None, false, 90_000));
+        // Never answered, disabled, faulted, or radio paused for keep-awake.
+        assert!(!ble_health_allows_wake_controls(true, None, 0, None, false, 1_030));
+        assert!(!ble_health_allows_wake_controls(false, None, 1_000, None, false, 1_030));
+        assert!(!ble_health_allows_wake_controls(
+            true,
+            Some(HealthRecord {
+                fault: FaultKind::TransportError,
+                since_ts: 1_020,
+            }),
+            1_000,
+            None,
+            false,
+            1_040,
+        ));
+        assert!(!ble_health_allows_wake_controls(
+            true,
+            Some(HealthRecord {
+                fault: FaultKind::RepairRequired,
+                since_ts: 900,
+            }),
+            1_000,
+            None,
+            false,
+            1_040,
+        ));
+        assert!(!ble_health_allows_wake_controls(
+            true,
+            None,
+            1_000,
+            Some("keep_awake"),
+            false,
+            1_030,
         ));
     }
 

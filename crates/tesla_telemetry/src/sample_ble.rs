@@ -250,9 +250,21 @@ pub async fn sample_climate_ble(session: &PersistentSession) -> Result<ClimateRe
             let car_server::climate_state::OptionalIsClimateOn::IsClimateOn(b) = v;
             *b
         });
+    use car_server::climate_state as cls;
+    let driver_temp_setting_c = climate.optional_driver_temp_setting.as_ref().map(|v| {
+        let cls::OptionalDriverTempSetting::DriverTempSetting(t) = v;
+        *t as f64
+    });
+    let min_avail_temp_c = climate.optional_min_avail_temp_celsius.as_ref().map(|v| {
+        let cls::OptionalMinAvailTempCelsius::MinAvailTempCelsius(t) = v;
+        *t as f64
+    });
+    let max_avail_temp_c = climate.optional_max_avail_temp_celsius.as_ref().map(|v| {
+        let cls::OptionalMaxAvailTempCelsius::MaxAvailTempCelsius(t) = v;
+        *t as f64
+    });
     let meta = build_meta(climate.timestamp.as_ref(), started);
 
-    use car_server::climate_state as cls;
     let detail = ClimateDetail {
         driver_setpoint_c: climate.optional_driver_temp_setting.as_ref().map(|v| {
             let cls::OptionalDriverTempSetting::DriverTempSetting(n) = v;
@@ -292,6 +304,9 @@ pub async fn sample_climate_ble(session: &PersistentSession) -> Result<ClimateRe
         interior_temp_c,
         exterior_temp_c,
         hvac_on,
+        driver_temp_setting_c,
+        min_avail_temp_c,
+        max_avail_temp_c,
         meta,
         detail,
     })

@@ -984,6 +984,9 @@ async fn tick(
                                 refresh.interior_temp_c = c.interior_temp_c;
                                 refresh.exterior_temp_c = c.exterior_temp_c;
                                 refresh.hvac_on = c.hvac_on;
+                                refresh.driver_temp_setting_c = c.driver_temp_setting_c;
+                                refresh.min_avail_temp_c = c.min_avail_temp_c;
+                                refresh.max_avail_temp_c = c.max_avail_temp_c;
                                 any_ok = true;
                             }
                             Err(e) => warn!("parked-awake climate refresh failed: {e:#}"),
@@ -1262,6 +1265,9 @@ async fn tick(
                     sample.interior_temp_c = c.interior_temp_c;
                     sample.exterior_temp_c = c.exterior_temp_c;
                     sample.hvac_on = c.hvac_on;
+                    sample.driver_temp_setting_c = c.driver_temp_setting_c;
+                    sample.min_avail_temp_c = c.min_avail_temp_c;
+                    sample.max_avail_temp_c = c.max_avail_temp_c;
                     true
                 }
                 Err(e) => {
@@ -1948,7 +1954,11 @@ async fn handle_action_request(
             result.map(|()| String::new())
         }
         Dispatch::Action(action) => {
-            let result = session.send_action(action).await;
+            let result = if sentryusb_tesla_ble::actions::wakes_car_first(&verb) {
+                session.send_action_waking(action).await
+            } else {
+                session.send_action(action).await
+            };
             let elapsed_ms = started.elapsed().as_millis();
             match &result {
                 Ok(bytes) => info!(

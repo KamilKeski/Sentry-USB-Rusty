@@ -40,10 +40,11 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
           charging_amps_set, charge_current_request_max, charge_port_door_open, \
           latitude, longitude, \
           source, charge_minutes_to_full, charging_state, \
-          tire_fl_seen_ts, tire_fr_seen_ts, tire_rl_seen_ts, tire_rr_seen_ts) \
+          tire_fl_seen_ts, tire_fr_seen_ts, tire_rl_seen_ts, tire_rr_seen_ts, \
+          driver_temp_setting_c, min_avail_temp_c, max_avail_temp_c) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
                  ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, \
-                 ?25, ?26, ?27, ?28, ?29, ?30, ?31) \
+                 ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34) \
          ON CONFLICT(ts) DO UPDATE SET \
            battery_pct                = COALESCE(excluded.battery_pct, battery_pct), \
            battery_temp_c             = COALESCE(excluded.battery_temp_c, battery_temp_c), \
@@ -75,7 +76,10 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
            tire_fl_seen_ts            = COALESCE(excluded.tire_fl_seen_ts, tire_fl_seen_ts), \
            tire_fr_seen_ts            = COALESCE(excluded.tire_fr_seen_ts, tire_fr_seen_ts), \
            tire_rl_seen_ts            = COALESCE(excluded.tire_rl_seen_ts, tire_rl_seen_ts), \
-           tire_rr_seen_ts            = COALESCE(excluded.tire_rr_seen_ts, tire_rr_seen_ts)",
+           tire_rr_seen_ts            = COALESCE(excluded.tire_rr_seen_ts, tire_rr_seen_ts), \
+           driver_temp_setting_c      = COALESCE(excluded.driver_temp_setting_c, driver_temp_setting_c), \
+           min_avail_temp_c           = COALESCE(excluded.min_avail_temp_c, min_avail_temp_c), \
+           max_avail_temp_c           = COALESCE(excluded.max_avail_temp_c, max_avail_temp_c)",
         params![
             s.ts,
             s.battery_pct,
@@ -108,6 +112,9 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
             s.tire_fr_seen_ts,
             s.tire_rl_seen_ts,
             s.tire_rr_seen_ts,
+            s.driver_temp_setting_c,
+            s.min_avail_temp_c,
+            s.max_avail_temp_c,
         ],
     )?;
     Ok(())
@@ -174,6 +181,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(seen, (Some(1_699_993_000), None));
+    }
+
+    #[test]
+    fn insert_persists_climate_setpoint_and_range() {
+        let conn = fresh_memory_db();
+        let climate = Sample {
+            ts: 1_700_000_300,
+            hvac_on: Some(true),
+            driver_temp_setting_c: Some(21.5),
+            min_avail_temp_c: Some(15.0),
+            max_avail_temp_c: Some(28.0),
+            source: "state".into(),
+            ..Sample::default()
+        };
+        insert(&conn, &climate).unwrap();
+        // A same-second charge refresh must not erase the setpoint.
+        insert(&conn, &Sample { ts: climate.ts, battery_pct: Some(80.0), source: "state".into(), ..Sample::default() }).unwrap();
+
+        let values: (Option<f64>, Option<f64>, Option<f64>) = conn
+            .query_row(
+                "SELECT driver_temp_setting_c, min_avail_temp_c, max_avail_temp_c \
+                 FROM telemetry_samples WHERE ts = ?1",
+                [climate.ts],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(values, (Some(21.5), Some(15.0), Some(28.0)));
     }
 
     #[test]
