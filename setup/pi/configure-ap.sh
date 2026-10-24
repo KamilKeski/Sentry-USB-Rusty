@@ -223,6 +223,16 @@ then
       exit 1
     fi
   fi
+  # The hotspot hands out no router or DNS, so phones keep their own internet
+  # while joined. NM's shared-mode dnsmasq reads this directory each time the
+  # hotspot starts. Same contents as ap_profile::AP_DNSMASQ_CONTENTS.
+  mkdir -p /etc/NetworkManager/dnsmasq-shared.d
+  cat > /etc/NetworkManager/dnsmasq-shared.d/sentryusb-ap.conf << 'APDNSMASQEOF'
+# SentryUSB hotspot: reach the Pi only. No default route or DNS server, so
+# clients keep their own internet connection while joined.
+dhcp-option=tag:ap0,3
+dhcp-option=tag:ap0,6
+APDNSMASQEOF
   # Setup only installs the profile — Away Mode owns bringing the AP up.
   # Drop the scaffolding ap0 (it pins the shared radio to the AP channel and
   # its existence triggers archiveloop's wifi_cycle), and make sure the
@@ -285,6 +295,8 @@ then
 	dhcp-range=${NET}.10,${NET}.254,12h
 	# don't configure a default route, we're not a router
 	dhcp-option=3
+	# or a DNS server, so clients keep their own
+	dhcp-option=tag:ap0,6
 	EOF
 
   # configure hostapd

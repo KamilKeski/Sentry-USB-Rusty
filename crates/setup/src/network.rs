@@ -61,6 +61,9 @@ pub async fn configure_ap(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> 
             Duration::from_secs(120),
         ).await;
 
+        // Shared by both profile paths below: the hotspot hands out no
+        // router or DNS (see `AP_DNSMASQ_CONTENTS`).
+        ap_profile::install_ap_dnsmasq_conf()?;
         match nm_add_ap(&ssid, &pass, &ip, emitter).await {
             Ok(()) => {
                 teardown_ap_scaffolding().await;
@@ -160,6 +163,7 @@ pub async fn deconfigure_ap(emitter: &SetupEmitter) -> Result<()> {
 
     let _ = sentryusb_shell::run("iw", &["dev", "ap0", "del"]).await;
     let _ = std::fs::remove_file(dispatcher);
+    let _ = std::fs::remove_file(ap_profile::AP_DNSMASQ_CONF);
     let _ = std::fs::remove_file("/etc/network/if-up.d/sentryusb-ap");
 
     emitter.progress("WiFi access point removed.");
@@ -292,6 +296,28 @@ async fn nm_write_ap_file(
     Ok(())
 }
 
+/// Line in the hostapd path's `/etc/dnsmasq.conf` that stops dnsmasq
+/// advertising itself as the hotspot's DNS server, matching the NM hotspot
+/// (`ap_profile::AP_DNSMASQ_CONTENTS`). The startup migration adds it to
+/// existing installs.
+pub const HOSTAPD_DNSMASQ_NO_DNS: &str = "dhcp-option=tag:ap0,6";
+
+/// `/etc/dnsmasq.conf` for the hostapd path: DHCP on ap0 only, with no
+/// default route or DNS server, so clients keep their own internet.
+fn hostapd_dnsmasq_conf(net: &str) -> String {
+    format!(
+        "interface=lo,ap0\n\
+         no-dhcp-interface=lo,wlan0\n\
+         bind-interfaces\n\
+         bogus-priv\n\
+         dhcp-range={net}.10,{net}.254,12h\n\
+         # don't configure a default route, we're not a router\n\
+         dhcp-option=3\n\
+         # or a DNS server, so clients keep their own\n\
+         {HOSTAPD_DNSMASQ_NO_DNS}\n"
+    )
+}
+
 /// hostapd + dnsmasq path — for systems that don't use NetworkManager.
 async fn configure_hostapd_path(
     ssid: &str,
@@ -324,18 +350,7 @@ async fn configure_hostapd_path(
     let _ = std::fs::create_dir_all("/etc/udev/rules.d");
     std::fs::write("/etc/udev/rules.d/70-persistent-net.rules", udev_rule)?;
 
-    std::fs::write(
-        "/etc/dnsmasq.conf",
-        format!(
-            "interface=lo,ap0\n\
-             no-dhcp-interface=lo,wlan0\n\
-             bind-interfaces\n\
-             bogus-priv\n\
-             dhcp-range={net}.10,{net}.254,12h\n\
-             # don't configure a default route, we're not a router\n\
-             dhcp-option=3\n"
-        ),
-    )?;
+    std::fs::write("/etc/dnsmasq.conf", hostapd_dnsmasq_conf(net))?;
 
     let _ = std::fs::create_dir_all("/etc/hostapd");
     // 0600 — the file carries the WPA passphrase.
@@ -595,6 +610,21 @@ fn append_unless_contains(path: &str, needle: &str, text: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hostapd_dnsmasq_conf_sends_no_router_or_dns_and_keeps_dhcp() {
+        let conf = hostapd_dnsmasq_conf("192.168.66");
+        let options: Vec<&str> = conf.lines().filter(|line| !line.starts_with('#')).collect();
+        assert_eq!(options, [
+            "interface=lo,ap0", "no-dhcp-interface=lo,wlan0", "bind-interfaces", "bogus-priv",
+            "dhcp-range=192.168.66.10,192.168.66.254,12h", "dhcp-option=3", "dhcp-option=tag:ap0,6",
+        ]);
+        // The compatibility installer writes the same file (tab-indented heredoc).
+        let script = include_str!("../../../setup/pi/configure-ap.sh");
+        let rendered: String = conf.replace("192.168.66", "${NET}").lines()
+            .map(|line| format!("\t{line}\n")).collect();
+        assert!(script.contains(&rendered), "configure-ap.sh must write the same dnsmasq.conf");
+    }
 
     #[test]
     fn selects_one_wifi_device_when_both_adapters_are_active() {

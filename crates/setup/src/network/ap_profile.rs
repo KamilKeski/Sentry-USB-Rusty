@@ -1,12 +1,27 @@
-//! Read the installed AP profile without activating it or requesting secrets.
+//! Read the installed AP profile without activating it or requesting secrets,
+//! and install the hotspot's DHCP options for NetworkManager's dnsmasq.
 
 use std::future::Future;
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
 pub const AP_PROFILE: &str = "SENTRYUSB_AP";
 pub const AP_KEYFILE: &str = "/etc/NetworkManager/system-connections/SENTRYUSB_AP.nmconnection";
+/// NetworkManager's shared-mode dnsmasq reads this directory (`--conf-dir`,
+/// only when it exists). NM gives that dnsmasq no router or DNS options, so
+/// by default it advertises its own address as both; with no upstream away
+/// from home, phones then treat the hotspot as a broken internet link and
+/// may leave it. Options with no value suppress those defaults, and the
+/// `ap0` interface tag leaves any other shared connection unchanged.
+pub const AP_DNSMASQ_CONF: &str = "/etc/NetworkManager/dnsmasq-shared.d/sentryusb-ap.conf";
+pub const AP_DNSMASQ_CONTENTS: &str = "\
+# SentryUSB hotspot: reach the Pi only. No default route or DNS server, so
+# clients keep their own internet connection while joined.
+dhcp-option=tag:ap0,3
+dhcp-option=tag:ap0,6
+";
 const READ_ARGS: &[&str] = &[
     "-t", "--escape", "no", "-f",
     "802-11-wireless.mode,802-11-wireless.ssid,ipv4.addresses",
@@ -52,6 +67,22 @@ fn parse_nm_ap_result(result: Result<String>) -> Result<Option<ApProfile>> {
         bail!("The {AP_PROFILE} profile has no valid IPv4 address");
     }
     Ok(Some(ApProfile { ssid: ssid.to_string(), ip: ip.to_string() }))
+}
+
+/// Install `AP_DNSMASQ_CONTENTS`; a matching file is left untouched. NM
+/// reads it the next time it starts the hotspot's dnsmasq.
+pub(super) fn install_ap_dnsmasq_conf() -> Result<()> {
+    install_ap_dnsmasq_conf_at(Path::new(AP_DNSMASQ_CONF))
+}
+
+fn install_ap_dnsmasq_conf_at(path: &Path) -> Result<()> {
+    if std::fs::read_to_string(path).is_ok_and(|current| current == AP_DNSMASQ_CONTENTS) {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("could not create {}", dir.display()))?;
+    }
+    std::fs::write(path, AP_DNSMASQ_CONTENTS).with_context(|| format!("could not write {}", path.display()))
 }
 
 pub(super) async fn verify_nm_ap_profile(ssid: &str, ip: &str) -> Result<()> {
@@ -116,6 +147,38 @@ mod tests {
             PROFILE.replace("ssid:Road: Wi\\Fi", "ssid:"), PROFILE.replace("192.168.66.1/24", "")] {
             assert!(parse_nm_ap_result(Ok(out)).is_err());
         }
+    }
+
+    #[test]
+    fn hotspot_dnsmasq_conf_suppresses_router_and_dns_on_ap0_only() {
+        let options: Vec<&str> = AP_DNSMASQ_CONTENTS.lines()
+            .filter(|line| !line.starts_with('#')).collect();
+        assert_eq!(options, ["dhcp-option=tag:ap0,3", "dhcp-option=tag:ap0,6"]);
+        assert!(AP_DNSMASQ_CONF.starts_with("/etc/NetworkManager/dnsmasq-shared.d/"));
+    }
+
+    #[test]
+    fn compatibility_installer_writes_the_same_hotspot_dnsmasq_conf() {
+        let script = include_str!("../../../../setup/pi/configure-ap.sh");
+        let heredoc = format!("cat > {AP_DNSMASQ_CONF} << 'APDNSMASQEOF'\n{AP_DNSMASQ_CONTENTS}APDNSMASQEOF\n");
+        assert!(script.contains(&heredoc), "configure-ap.sh must install AP_DNSMASQ_CONTENTS verbatim");
+    }
+
+    #[test]
+    fn hotspot_dnsmasq_conf_install_creates_the_directory_and_is_idempotent() {
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("sentryusb-ap-dnsmasq-{}-{nonce}", std::process::id()));
+        let path = root.join("dnsmasq-shared.d/sentryusb-ap.conf");
+        install_ap_dnsmasq_conf_at(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), AP_DNSMASQ_CONTENTS);
+        let written = std::fs::metadata(&path).unwrap().modified().unwrap();
+        install_ap_dnsmasq_conf_at(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), written);
+
+        std::fs::write(&path, "dhcp-option=3\n").unwrap();
+        install_ap_dnsmasq_conf_at(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), AP_DNSMASQ_CONTENTS);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

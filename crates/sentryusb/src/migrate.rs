@@ -370,10 +370,30 @@ fi
 # Mode always raises the AP explicitly.
 if nmcli -t con show SENTRYUSB_AP &>/dev/null; then
   nmcli con modify SENTRYUSB_AP connection.autoconnect no 2>/dev/null || true
+  # The hotspot hands out no router or DNS, so phones keep their own
+  # internet (setup installs the same file). NM reads it the next time the
+  # hotspot starts; a running Away Mode session is left as it is.
+  mkdir -p "$(dirname {ap_dnsmasq_conf})"
+  cat > {ap_dnsmasq_conf}.new << 'APDNSMASQEOF'
+{ap_dnsmasq_contents}APDNSMASQEOF
+  if cmp -s {ap_dnsmasq_conf}.new {ap_dnsmasq_conf}; then
+    rm -f {ap_dnsmasq_conf}.new
+  else
+    mv -f {ap_dnsmasq_conf}.new {ap_dnsmasq_conf}
+  fi
   if [ ! -f /mutable/sentryusb_away_mode.json ]; then
     nmcli con down SENTRYUSB_AP 2>/dev/null || true
     iw dev ap0 del 2>/dev/null || true
   fi
+fi
+# The hostapd/ifupdown hotspot's dnsmasq hands out no DNS server either (it
+# never sent a router). Only a setup-written config is touched; dnsmasq reads
+# it the next time Away Mode starts the hotspot.
+if grep -qxF 'interface=lo,ap0' /etc/dnsmasq.conf 2>/dev/null \
+  && grep -qxF 'no-dhcp-interface=lo,wlan0' /etc/dnsmasq.conf \
+  && grep -qxF 'dhcp-option=3' /etc/dnsmasq.conf \
+  && ! grep -qxF '{hostapd_no_dns}' /etc/dnsmasq.conf; then
+  printf '%s\n' '# or a DNS server, so clients keep their own' '{hostapd_no_dns}' >> /etc/dnsmasq.conf
 fi
 WLAN=$(nmcli -t -f TYPE,DEVICE c show --active 2>/dev/null | grep 802-11-wireless | grep -v ':ap0$' | cut -d: -f2 | head -1)
 WLAN=${{WLAN:-wlan0}}
@@ -571,7 +591,10 @@ rm -f /root/bin/tesla-control /root/bin/tesla-keygen \
         tarball_url = tarball_url,
         repo = MIGRATE_REPO,
         helper_release_base = helper_release_base,
-        branch = MIGRATE_BRANCH
+        branch = MIGRATE_BRANCH,
+        ap_dnsmasq_conf = sentryusb_setup::network::ap_profile::AP_DNSMASQ_CONF,
+        ap_dnsmasq_contents = sentryusb_setup::network::ap_profile::AP_DNSMASQ_CONTENTS,
+        hostapd_no_dns = sentryusb_setup::network::HOSTAPD_DNSMASQ_NO_DNS,
     )
 }
 
@@ -620,6 +643,70 @@ mod tests {
             .status()
             .expect("bash not available");
         assert!(status.success(), "bash -n rejected the migration script");
+    }
+
+    #[test]
+    fn migration_installs_the_hotspot_dnsmasq_conf_for_existing_nm_profiles() {
+        use sentryusb_setup::network::ap_profile::{AP_DNSMASQ_CONF, AP_DNSMASQ_CONTENTS};
+        let script = build_migration_script("https://example.invalid/source.tar.gz", "v0.0.0");
+        let start = script.find("if nmcli -t con show SENTRYUSB_AP").unwrap();
+        let end = start + script[start..].find("\nfi\n").unwrap() + "\nfi\n".len();
+
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("sentryusb-ap-migrate-{}-{nonce}", std::process::id()));
+        let conf = root.join("dnsmasq-shared.d/sentryusb-ap.conf");
+        let block = script[start..end].replace(AP_DNSMASQ_CONF, conf.to_str().unwrap());
+        let harness = format!("set -eu\nnmcli() {{ :; }}\niw() {{ :; }}\n{block}");
+        let run = || {
+            let status = std::process::Command::new("bash").args(["-c", &harness]).status().unwrap();
+            assert!(status.success());
+        };
+
+        run();
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), AP_DNSMASQ_CONTENTS);
+        let written = std::fs::metadata(&conf).unwrap().modified().unwrap();
+        run();
+        assert_eq!(std::fs::metadata(&conf).unwrap().modified().unwrap(), written);
+        assert!(!conf.with_extension("conf.new").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn migration_stops_the_hostapd_dnsmasq_handing_out_dns_once() {
+        let script = build_migration_script("https://example.invalid/source.tar.gz", "v0.0.0");
+        let start = script.find("if grep -qxF 'interface=lo,ap0' /etc/dnsmasq.conf").unwrap();
+        let end = start + script[start..].find("\nfi\n").unwrap() + "\nfi\n".len();
+
+        let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let root = std::env::temp_dir().join(format!("sentryusb-dnsmasq-migrate-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let conf = root.join("dnsmasq.conf");
+        let block = script[start..end].replace("/etc/dnsmasq.conf", conf.to_str().unwrap());
+        let run = || {
+            let status = std::process::Command::new("bash").args(["-c", &format!("set -eu\n{block}")]).status().unwrap();
+            assert!(status.success());
+        };
+
+        // A config from an earlier setup gains the line once.
+        let before = "interface=lo,ap0\nno-dhcp-interface=lo,wlan0\nbind-interfaces\nbogus-priv\n\
+            dhcp-range=192.168.66.10,192.168.66.254,12h\n\
+            # don't configure a default route, we're not a router\ndhcp-option=3\n";
+        std::fs::write(&conf, before).unwrap();
+        run();
+        run();
+        let after = std::fs::read_to_string(&conf).unwrap();
+        assert_eq!(after, format!("{before}# or a DNS server, so clients keep their own\n{}\n",
+            sentryusb_setup::network::HOSTAPD_DNSMASQ_NO_DNS));
+
+        // Any other dnsmasq.conf (or none) is left alone.
+        let custom = "interface=eth0\ndhcp-range=10.0.0.10,10.0.0.50,12h\n";
+        std::fs::write(&conf, custom).unwrap();
+        run();
+        assert_eq!(std::fs::read_to_string(&conf).unwrap(), custom);
+        std::fs::remove_file(&conf).unwrap();
+        run();
+        assert!(!conf.exists());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
