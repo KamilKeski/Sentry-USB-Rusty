@@ -36,7 +36,7 @@ archive_run_command bash -c 'echo completed' > "$work/result"
 [[ $(cat "$work/result") == completed ]]
 
 # Exercise the real pipeline with hardware/network boundaries replaced.
-eval "$(awk '/^function archive_wait_for_processor / {keep=1} /^function slowblink / {exit} keep {print}' "$root/run/archiveloop" | sed "s@/root/bin/@$work/bin/@g; s@/mutable/@$work/mutable/@g")"
+eval "$(awk '/^function archive_wait_for_processor / {keep=1} /^function rtc_sync_systohc / {exit} keep {print}' "$root/run/archiveloop" | sed "s@/root/bin/@$work/bin/@g; s@/mutable/@$work/mutable/@g")"
 real_wait_source=$(declare -f archive_wait_for_processor)
 mkdir "$work/bin" "$work/mutable"
 touch "$work/mutable/archive_in_progress.json"

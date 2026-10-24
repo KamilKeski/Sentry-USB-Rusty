@@ -362,23 +362,8 @@ function headless_setup_mark_setup_success () {
 }
 
 function flash () {
-  local ON=0
-  local OFF=1
-  if isPi4 || isPi5
-  then
-    ON=1
-    OFF=0
-  fi
-  echo none > "$STATUSLED/trigger"
-  echo $OFF > "$STATUSLED/brightness"
-  sleep 1
-  for ((i=1; i<=$1; i++))
-  do
-    echo $ON > "$STATUSLED/brightness"
-    sleep .2
-    echo $OFF > "$STATUSLED/brightness"
-    sleep .8
-  done
+  # Progress belongs in the log; leave hardware to firmware/the runtime owner.
+  setup_progress "Setup phase $1"
 }
 
 function headless_setup_progress_flash () {
@@ -527,6 +512,7 @@ Environment=MALLOC_ARENA_MAX=2
 ExecStartPre=-/bin/systemctl stop nginx
 ExecStartPre=-/bin/systemctl disable nginx
 ExecStart=/opt/sentryusb/sentryusb --port 80
+ExecStopPost=-/opt/sentryusb/sentryusb status-led-restore
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -1553,16 +1539,7 @@ then
   fi
 fi
 
-# Turn on all leds in case they're still flashing
-# from pre-setup.
-for led in /sys/class/leds/*
-do
-  if [ -e "$led/trigger" ]
-  then
-    echo none > "$led/trigger" || true
-    echo 1 > "$led/brightness" || true
-  fi
-done
+# Leave native power/boot signals and the runtime LED controller alone.
 
 # Update config.txt if needed
 # Pi 3 needs dr_mode=peripheral to ensure the DWC2 controller operates in

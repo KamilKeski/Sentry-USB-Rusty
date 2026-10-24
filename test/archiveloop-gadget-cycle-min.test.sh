@@ -440,7 +440,7 @@ connect_usb_drives_to_host_locked
 
 # M: a failed archive connection or transfer must leave a healthy USB
 # presentation alone. No optional media changes are pending in this case.
-pipeline=$(awk '/^function archive_clips / {keep=1} /^function slowblink / {exit} keep {print}' "$script")
+pipeline=$(awk '/^function archive_clips / {keep=1} /^function rtc_sync_systohc / {exit} keep {print}' "$script")
 pipeline=${pipeline//\/tmp\/flag_post_archive/$workdir/post-archive}
 pipeline=${pipeline//\/root\/bin\/disconnect-archive.sh/test_disconnect_archive}
 pipeline=${pipeline//\/root\/bin\/send-live-activity/test_live_activity}
