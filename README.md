@@ -112,6 +112,32 @@ Plus a **high-quality MicroSD card sized for the storage layout you choose** and
 
 ---
 
+## Status light
+
+After Linux boots, Sentry USB uses the Pi's existing activity light to show what it is doing. The Pi's normal firmware boot and error codes come first and remain unchanged.
+
+**Different colours are for Raspberry Pi 5 only.** Pi 4, Pi Zero 2 W, Pi 3A+ and other supported single-colour boards use **the same blink patterns with the same meanings** on their activity LED. Their separate power light stays under the Pi's control.
+
+<p align="center">
+  <a href="docs/images/status-led-guide.svg"><img src="docs/images/status-led-guide.svg" alt="Six Sentry USB status patterns, with animated Pi 5 colours and single-colour activity lights side by side. The table below describes every pattern." width="1040"></a><br>
+  <em>Open the image for a full-size view. The bars show each pattern even with animation disabled.</em>
+</p>
+
+| Status | Blink pattern | What it means |
+|---|---|---|
+| **Starting Sentry USB** | 1 second on, 1 second off | The application is starting. Amber on Pi 5. |
+| **Preparing / busy** | 250 ms on, 250 ms off | Preparing storage or USB is offline for maintenance. Amber on Pi 5. |
+| **Ready, waiting for USB** | One short flash every 3 seconds | Ready for a USB host, or the USB connection is suspended. |
+| **Connected over USB** | **Two short flashes every 3 seconds** | Normal startup completed, the archive worker is alive, storage is usable, and a USB host has configured the drive. |
+| **Camera-disk writes** | Quick pulses: 400 ms on, 100 ms off | New writes to the camera image while it is presented to the host. Returns to the double blink after 3 seconds without another observed write. |
+| **Needs attention** | Mostly on, with a brief dark dip every 3 seconds | Check the web UI and service logs for a startup, storage, archive-worker or USB-state problem. Red on Pi 5. |
+
+Connected and write-activity signals are green on Pi 5. **Write activity is not proof of valid footage:** filesystem metadata and formatting can also write to the camera image. These are on/off pulses, not smooth fades.
+
+See the [full status-light guide](wiki/Status-LED.md) for details, limitations and restoration of the Pi's normal LED behaviour when Sentry USB stops.
+
+---
+
 ## Privacy
 
 By default, Sentry USB sends **no device identifier** to our servers. Here's everything it ever sends:
