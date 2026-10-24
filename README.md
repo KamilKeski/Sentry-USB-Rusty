@@ -116,7 +116,7 @@ Plus a **high-quality MicroSD card sized for the storage layout you choose** and
 
 After Linux boots, Sentry USB uses the Pi's existing activity light to show what it is doing. The Pi's normal firmware boot and error codes come first and remain unchanged.
 
-**Different colours are for Raspberry Pi 5 only.** Pi 4, Pi Zero 2 W, Pi 3A+ and other supported single-colour boards use **the same blink patterns with the same meanings** on their activity LED. Their separate power light stays under the Pi's control.
+**Different colours are for Raspberry Pi 5 only.** Pi 4, Pi Zero 2 W, Pi 3A+ and other supported single-colour boards use **the same blink patterns with the same meanings** on their activity LED. On boards with a separate power light, that light stays under the Pi's control.
 
 <p align="center">
   <a href="docs/images/status-led-guide.svg"><img src="docs/images/status-led-guide.svg" alt="Six Sentry USB status patterns, with animated Pi 5 colours and single-colour activity lights side by side. The table below describes every pattern." width="1040"></a><br>

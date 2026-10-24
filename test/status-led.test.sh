@@ -9,6 +9,7 @@ from pathlib import Path
 import re, sys
 root, scratch = map(Path, sys.argv[1:])
 source = (root/'run/archiveloop').read_text()
+assert '# sentryusb-status-led: cooperative-v1' in source, 'new archive workers must advertise the LED handoff protocol'
 match = re.search(r'^function status_led_archive \(\) \{.*?^\}', source, re.M|re.S)
 assert match, 'archive must publish process-bound status without writing LEDs'
 (scratch/'hint.sh').write_text(match[0].replace('/run/sentryusb-led', str(scratch/'run')))

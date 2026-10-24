@@ -51,6 +51,8 @@ pub struct Observation {
     /// Exact UDC, LUN identity and media-transition generation.
     pub session: Option<String>,
     pub camera: Option<CameraStamp>,
+    /// The existing whole-cycle USB maintenance flock is actively held.
+    pub maintenance: bool,
 }
 #[derive(Default)]
 pub struct Model {
@@ -66,12 +68,13 @@ impl Model {
             self.missing_since = None;
             self.worker_seen = true;
         }
-        if o.link != Link::Unbound || o.archive != ArchivePhase::Ready {
+        if o.link != Link::Unbound || o.archive != ArchivePhase::Ready || o.maintenance {
             self.unbound_since = None;
         }
         let state = match app {
             AppPhase::Starting | AppPhase::Stopping => State::Starting,
             AppPhase::Fault => State::Attention,
+            AppPhase::Ready if o.maintenance && o.link != Link::Configured => State::Preparing,
             AppPhase::Ready => match o.archive {
                 ArchivePhase::Fault => State::Attention,
                 ArchivePhase::Missing => {
@@ -174,6 +177,7 @@ mod tests {
                 size: 1000,
                 modified_ns: 1234,
             }),
+            maintenance: false,
         }
     }
     #[test]

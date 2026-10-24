@@ -164,6 +164,6 @@
     <text x="1008" y="631" class="tick" text-anchor="end">6 s</text>
   </g>
   <path d="M32 668H1008" stroke="#453b4e"/>
-  <text x="32" y="696" class="secondary">Pi 4, Pi Zero 2 W and Pi 3A+: use the same patterns on the activity light; the power light stays native.</text>
+  <text x="32" y="696" class="secondary">Pi 4, Pi Zero 2 W and Pi 3A+ use the same rhythms. Any separate power light stays under Pi control.</text>
   <text x="32" y="718" class="tick">Examples show Sentry USB after Linux boots. Camera-disk activity does not certify valid video footage.</text>
 </svg>

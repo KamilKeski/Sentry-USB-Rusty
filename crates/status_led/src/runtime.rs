@@ -41,25 +41,24 @@ impl Drop for Inner {
 #[derive(Clone)]
 pub struct Controller(Arc<Inner>);
 impl Controller {
-    /// Starts only when a supported activity LED can be exclusively acquired.
+    /// Starts on supported hardware, deferring ownership while a legacy archive
+    /// worker is running. A refreshed script does not replace that worker's code.
     /// The callback must only inspect storage. A detached LED never gates startup.
     pub fn start(storage_ready: impl Fn() -> bool + Send + 'static) -> Option<Self> {
-        let paths = Paths::default();
-        let driver = match Driver::claim(&paths) {
-            Ok(Some(d)) => d,
-            Ok(None) => return None,
-            Err(e) => {
-                eprintln!("status LED unavailable: {e}");
-                return None;
-            }
-        };
+        Self::start_at(Paths::default(), storage_ready)
+    }
+    fn start_at(paths: Paths, storage_ready: impl Fn() -> bool + Send + 'static) -> Option<Self> {
+        if !Driver::available(&paths) {
+            return None;
+        }
         let phase = Arc::new(AtomicU8::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let (thread_phase, thread_stop) = (phase.clone(), stop.clone());
         let join = thread::Builder::new()
             .name("status-led".into())
             .spawn(move || {
-                let mut driver = driver;
+                let mut driver: Option<Driver> = None;
+                let mut announced_wait = false;
                 let mut model = Model::default();
                 let start = Instant::now();
                 let mut state = State::Starting;
@@ -68,6 +67,21 @@ impl Controller {
                 while !thread_stop.load(Ordering::Acquire) {
                     let now = Instant::now();
                     if now >= next_sample {
+                        next_sample = now + Duration::from_millis(500);
+                        if driver.is_none() {
+                            match Driver::claim(&paths) {
+                                Ok(Some(owner)) => { driver = Some(owner); changed = now; }
+                                Ok(None) => {
+                                    if !announced_wait {
+                                        eprintln!("status LED waiting for archive handoff or LED ownership");
+                                        announced_wait = true;
+                                    }
+                                    thread::sleep(Duration::from_millis(20));
+                                    continue;
+                                }
+                                Err(e) => { eprintln!("status LED unavailable: {e}"); break; }
+                            }
+                        }
                         let app = match thread_phase.load(Ordering::Acquire) {
                             0 => AppPhase::Starting,
                             1 => AppPhase::Ready,
@@ -83,11 +97,13 @@ impl Controller {
                             state = new;
                             changed = now;
                         }
-                        next_sample = now + Duration::from_millis(500);
                     }
-                    if let Err(e) = driver.set(state.frame(changed.elapsed())) {
-                        eprintln!("status LED disabled: {e}");
-                        break;
+                    if thread_stop.load(Ordering::Acquire) { break; }
+                    if let Some(driver) = &mut driver {
+                        if let Err(e) = driver.set(state.frame(changed.elapsed())) {
+                            eprintln!("status LED disabled: {e}");
+                            break;
+                        }
                     }
                     thread::sleep(Duration::from_millis(20));
                 }
@@ -181,5 +197,59 @@ mod tests {
         c.fault();
         c.ready();
         assert_eq!(c.0.phase.load(Ordering::Acquire), 2);
+    }
+    #[test]
+    fn controller_retries_after_legacy_worker_exits_without_server_restart() {
+        use std::fs;
+        let fixture = tempfile::tempdir().unwrap();
+        let p = Paths {
+            leds: fixture.path().join("leds"),
+            model: fixture.path().join("model"),
+            run: fixture.path().join("run"),
+            proc: fixture.path().join("proc"),
+            archive_script: fixture.path().join("archiveloop"),
+            gadget: fixture.path().join("gadget"),
+            cycle_lock: fixture.path().join("cycle.lock"),
+            ..Paths::default()
+        };
+        fs::create_dir_all(p.leds.join("ACT")).unwrap();
+        fs::write(p.leds.join("ACT/trigger"), "none [mmc0] timer").unwrap();
+        fs::write(p.leds.join("ACT/brightness"), "0").unwrap();
+        fs::write(p.leds.join("ACT/max_brightness"), "1").unwrap();
+        fs::write(
+            &p.archive_script,
+            "# sentryusb-status-led: cooperative-v1\n",
+        )
+        .unwrap();
+        fs::create_dir_all(p.proc.join("42")).unwrap();
+        fs::write(p.proc.join("42/cmdline"), b"bash\0/root/bin/archiveloop\0").unwrap();
+        fs::write(
+            p.proc.join("42/stat"),
+            format!("42 (archiveloop) S {} 123 0", vec!["0"; 18].join(" ")),
+        )
+        .unwrap();
+        let controller =
+            Controller::start_at(p.clone(), || true).expect("deferred controller can keep waiting");
+        thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            fs::read_to_string(p.leds.join("ACT/trigger")).unwrap(),
+            "none [mmc0] timer"
+        );
+        fs::remove_dir_all(p.proc.join("42")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while fs::read_to_string(p.leds.join("ACT/trigger")).unwrap() != "none"
+            && Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            fs::read_to_string(p.leds.join("ACT/trigger")).unwrap(),
+            "none"
+        );
+        controller.stop();
+        assert_eq!(
+            fs::read_to_string(p.leds.join("ACT/trigger")).unwrap(),
+            "mmc0"
+        );
     }
 }

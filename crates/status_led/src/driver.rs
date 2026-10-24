@@ -159,13 +159,16 @@ fn restore_locked(paths: &Paths) -> io::Result<()> {
     fs::remove_file(path)
 }
 impl Driver {
+    pub(crate) fn available(paths: &Paths) -> bool {
+        activity_led(paths).is_some()
+    }
     pub fn claim(paths: &Paths) -> io::Result<Option<Self>> {
-        let Some(name) = ["ACT", "led0", "status", "user-led2", "radxa-zero:green"]
-            .into_iter()
-            .find(|n| paths.leds.join(n).is_dir())
-        else {
+        let Some(name) = activity_led(paths) else {
             return Ok(None);
         };
+        if !paths.archive_handoff_safe() {
+            return Ok(None);
+        }
         let Some(lock) = lock(paths)? else {
             return Ok(None);
         };
@@ -230,13 +233,19 @@ impl Drop for Driver {
     }
 }
 pub fn restore(paths: &Paths) -> io::Result<()> {
-    if !paths.run.exists() {
+    if !paths.run.exists() || !paths.archive_handoff_safe() {
         return Ok(());
     }
     let Some(_lock) = lock(paths)? else {
         return Ok(());
     };
     restore_locked(paths)
+}
+
+fn activity_led(paths: &Paths) -> Option<&'static str> {
+    ["ACT", "led0", "status", "user-led2", "radxa-zero:green"]
+        .into_iter()
+        .find(|name| paths.leds.join(name).is_dir())
 }
 
 #[cfg(test)]
@@ -255,8 +264,11 @@ mod tests {
             leds: r.join("leds"),
             model: r.join("model"),
             run: r.join("run"),
+            proc: r.join("proc"),
+            archive_script: r.join("archiveloop"),
             ..Paths::default()
         };
+        fs::create_dir_all(&p.proc).unwrap();
         fs::write(&p.model, model).unwrap();
         led(&p.leds.join("ACT"));
         led(&p.leds.join("PWR"));
@@ -372,6 +384,53 @@ mod tests {
         drop(next);
         assert_eq!(brightness(&p, "ACT"), "0");
         assert_eq!(brightness(&p, "PWR"), "0");
+        assert_eq!(
+            fs::read_to_string(p.leds.join("ACT/trigger")).unwrap(),
+            "mmc0"
+        );
+    }
+
+    fn archive_process(p: &Paths, pid: u32, parent: u32, start: u64) {
+        let dir = p.proc.join(pid.to_string());
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("stat"),
+            format!(
+                "{pid} (archiveloop) S {parent} {} {start} 0",
+                vec!["0"; 17].join(" ")
+            ),
+        )
+        .unwrap();
+        fs::write(dir.join("cmdline"), b"bash\0/root/bin/archiveloop\0").unwrap();
+    }
+    #[test]
+    fn upgrade_waits_for_legacy_worker_even_after_atomic_script_refresh() {
+        let (_d, p) = fixture("Raspberry Pi 5 Model B");
+        fs::write(&p.archive_script, "function slowblink () { echo timer; }\n").unwrap();
+        archive_process(&p, 42, 1, 123);
+        assert!(Driver::claim(&p).unwrap().is_none());
+        let replacement = p.archive_script.with_extension("new");
+        fs::write(&replacement, "# sentryusb-status-led: cooperative-v1\n").unwrap();
+        fs::rename(replacement, &p.archive_script).unwrap();
+        // The running old process still has its original code after replacement.
+        assert!(Driver::claim(&p).unwrap().is_none());
+        assert!(!p.run.join("restore.json").exists());
+        assert_eq!(
+            fs::read_to_string(p.leds.join("ACT/trigger")).unwrap(),
+            "none [mmc0] timer"
+        );
+        // A valid new worker must not hide a separate legacy worker.
+        archive_process(&p, 83, 1, 200);
+        archive_process(&p, 84, 83, 201);
+        fs::create_dir_all(&p.run).unwrap();
+        fs::write(p.run.join("archive"), "84 201 ready\n").unwrap();
+        assert!(Driver::claim(&p).unwrap().is_none());
+        fs::remove_dir_all(p.proc.join("42")).unwrap();
+        // The cooperative worker and its flock/shell parent are safe together.
+        let owner = Driver::claim(&p)
+            .unwrap()
+            .expect("new worker handed off LED control");
+        drop(owner);
         assert_eq!(
             fs::read_to_string(p.leds.join("ACT/trigger")).unwrap(),
             "mmc0"

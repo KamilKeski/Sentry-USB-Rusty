@@ -38,7 +38,16 @@ If the light shows a fault, check the web UI and service logs for unavailable
 storage, failed startup, a failed archive worker, or an unreadable USB state.
 LED control is optional: missing hardware or a write failure cannot stop startup,
 archiving or USB presentation. Apply updates through the normal reboot flow so
-old archive scripts cannot keep controlling the same LED.
+old archive scripts exit. During an upgrade, the new controller waits for any
+legacy archive worker to exit before taking over the LEDs, then takes over
+automatically without needing another server restart.
+
+Active USB maintenance is tracked for the entire existing gadget-cycle lock,
+including work between disconnect and reconnect. Archive phase changes alone do
+not clear recent camera-disk activity while USB remains connected. USB state is
+sampled every 500 ms; a physical disconnect and reconnect completed between
+samples can be missed. Software-controlled gadget cycles explicitly reset the
+write baseline even when they complete between samples.
 
 Native Pi 5 colour/polarity, visible pulse timing, shutdown and actual-car write
 indication must be checked on hardware; Linux fixture tests do not establish that
