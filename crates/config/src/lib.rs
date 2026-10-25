@@ -11,7 +11,10 @@ pub type SetupConfig = HashMap<String, String>;
 
 /// Archive speed is stored in SI units independently of display preferences.
 pub fn validate_archive_min_speed(config: &SetupConfig) -> std::result::Result<f32, String> {
-    let raw = config.get("ARCHIVE_RECENTCLIPS_MIN_SPEED_MPS").map(String::as_str).unwrap_or("0.5");
+    let raw = config
+        .get("ARCHIVE_RECENTCLIPS_MIN_SPEED_MPS")
+        .map(String::as_str)
+        .unwrap_or("0.5");
     match raw.parse::<f32>() {
         Ok(value) if value.is_finite() && value >= 0.0 => Ok(value),
         _ => Err("Archive speed must be a finite number greater than or equal to zero.".into()),

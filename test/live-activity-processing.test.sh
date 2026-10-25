@@ -20,7 +20,7 @@ copy_step=$(awk '/^function archive_teslacam_clips / {keep=1} /^function / && !/
 grep -q 'send-live-activity update processing 0 0 0 0 high' <<< "$copy_step"
 
 # ── archive_clips with hardware and network boundaries stubbed ──
-eval "$(awk '/^function archive_wait_for_processor / {keep=1} /^function slowblink / {exit} keep {print}' "$root/run/archiveloop" | sed "s@/root/bin/@$work/bin/@g; s@/mutable/@$work/mutable/@g")"
+eval "$(awk '/^function archive_wait_for_processor / {keep=1} /^function rtc_sync_systohc / {exit} keep {print}' "$root/run/archiveloop" | sed "s@/root/bin/@$work/bin/@g; s@/mutable/@$work/mutable/@g")"
 mkdir -p "$work/bin" "$work/mutable"
 for cmd in connect-archive.sh disconnect-archive.sh; do
   printf '#!/bin/bash\n' > "$work/bin/$cmd"

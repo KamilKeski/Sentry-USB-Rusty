@@ -12,6 +12,7 @@ hex = "0.4"
 
 sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
 sentryusb-config = { path = "../config", package = "sentryusb-config" }
+sentryusb-status-led = { path = "../status_led" }
 
 # unix (not just linux): cycle_lock's flock also runs on the macOS dev harness
 [target.'cfg(unix)'.dependencies]

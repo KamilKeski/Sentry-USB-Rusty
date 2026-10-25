@@ -11,6 +11,7 @@
 - [Privacy](Privacy)
 - [Sentry Cloud](Sentry-Cloud)
 - [Troubleshooting](Troubleshooting)
+- [Status Light](Status-LED)
 - [FAQ](FAQ)
 
 ---
