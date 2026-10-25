@@ -1799,6 +1799,26 @@ function archive_teslacam_clips () {
   # apply custom removals/additions
   filterfile "${sentrylist}"
 
+  # Apply after custom additions so the driving-only policy covers every
+  # RecentClips candidate and is shared by all archive backends.
+  if [ "${ARCHIVE_RECENTCLIPS_DRIVING_ONLY:-false}" = "true" ]
+  then
+    if ! /opt/sentryusb/sentryusb filter-archive-recent-driving \
+        --root "$overlaymerged" --input "$sentrylist" --output "${sentrylist}.driving" \
+        --min-speed-mps "${ARCHIVE_RECENTCLIPS_MIN_SPEED_MPS-0.5}"
+    then
+      log "ERROR: driving metadata filter failed; archive deferred"
+      umount "$overlaymerged"
+      return 1
+    fi
+    if ! mv "${sentrylist}.driving" "$sentrylist"
+    then
+      log "ERROR: could not apply driving metadata filter; archive deferred"
+      umount "$overlaymerged"
+      return 1
+    fi
+  fi
+
   local -r sentry_count=$(grep -c -v TeslaTrackMode "$sentrylist")
   local -r trackmode_count=$(grep -c TeslaTrackMode "$sentrylist")
   local -r ignore_count=$(wc -l < "$ignorelist")
