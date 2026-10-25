@@ -2,9 +2,15 @@
 
 Once Linux has booted and the Sentry USB server starts, the existing activity
 LED shows application status. Raspberry Pi firmware boot codes remain unchanged.
-Pi 5 uses its red/green light to show colours; Pi Zero, Pi 3/4 and supported
-single-colour boards show the same rhythms on their activity light. The Pi 3/4
-red power light is left alone.
+**Different colours are for Raspberry Pi 5 only.** Pi 4, Pi Zero 2 W, Pi 3A+
+and other supported single-colour boards show **the same blink patterns with
+the same meanings** on their activity light. On boards with a separate power
+light, that light stays under the Pi's control.
+
+<p align="center">
+  <a href="images/status-led-guide.svg"><img src="images/status-led-guide.svg" alt="Six Sentry USB status patterns, with animated Pi 5 colours and single-colour activity lights side by side. The table below describes every pattern." width="1040"></a><br>
+  <em>Open the image for a full-size view. The bars show each pattern even with animation disabled.</em>
+</p>
 
 | Meaning | Pi 5 colour | Pattern |
 | --- | --- | --- |
