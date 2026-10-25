@@ -24,4 +24,5 @@ sentryusb-drives = { path = "../drives", package = "sentryusb-drives" }
 sentryusb-api = { path = "../api", package = "sentryusb-api" }
 sentryusb-setup = { path = "../setup", package = "sentryusb-setup" }
 sentryusb-gadget = { path = "../usb_gadget", package = "sentryusb-gadget" }
+sentryusb-status-led = { path = "../status_led" }
 sentryusb-cloud-uploader = { path = "../cloud_uploader", package = "sentryusb-cloud-uploader" }

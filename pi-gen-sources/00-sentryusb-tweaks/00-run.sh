@@ -265,6 +265,7 @@ Type=simple
 # (re-flashing the SD card into a different Pi) is handled automatically.
 ExecStartPre=/usr/local/bin/sentryusb-pick-binary
 ExecStart=/opt/sentryusb/sentryusb-current --port 80
+ExecStopPost=-/opt/sentryusb/sentryusb-current status-led-restore
 Restart=always
 RestartSec=5
 # Per-crate log filter. Our crates emit at info; dependency chatter

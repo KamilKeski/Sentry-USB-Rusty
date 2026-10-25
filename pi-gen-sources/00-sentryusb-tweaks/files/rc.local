@@ -39,24 +39,9 @@ fi
 
 SETUP_LOGFILE=/sentryusb/sentryusb-setup.log
 
-function write_all_leds {
-  for led in /sys/class/leds/*
-  do
-    echo "$1" > "$led/$2" || true
-  done &> /dev/null
-}
-
 function error_strobe() {
-  modprobe ledtrig_timer || true
-  write_all_leds timer trigger
-  while true
-  do
-    write_all_leds 1 delay_on
-    write_all_leds 100 delay_off
-    sleep 1
-    write_all_leds 0 delay_on
-    sleep 1
-  done
+  # Never replace firmware diagnostic codes or fight the runtime LED owner.
+  echo "Sentry USB setup failed; inspect $SETUP_LOGFILE" >&2
 }
 
 function setup_progress () {
