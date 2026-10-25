@@ -83,16 +83,48 @@ fn source_identity(path: &Path) -> Result<String> {
         metadata.mtime(), metadata.mtime_nsec(), metadata.ctime(), metadata.ctime_nsec()))
 }
 
+const LEGACY_IMPORT_MARKER: &str = "archive_driving_evidence_import_v1";
+
+fn import_legacy_evidence(db: &rusqlite::Connection, legacy: &Path) -> Result<()> {
+    if crate::schema::meta_get(db, LEGACY_IMPORT_MARKER)?.is_some() || !legacy.exists() {
+        return Ok(());
+    }
+    // Keep the old cache untouched for rollback. Never create a missing source.
+    let source = rusqlite::Connection::open_with_flags(
+        legacy, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).context("Read legacy archive driving cache")?;
+    source.busy_timeout(Duration::from_secs(5))?;
+    let mut query = source.prepare("SELECT path, identity, gear, max_speed FROM evidence_v1")?;
+    let rows = query.query_map([], |row| Ok((
+        row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+        row.get::<_, bool>(2)?, row.get::<_, f32>(3)?,
+    )))?.collect::<rusqlite::Result<Vec<_>>>()?;
+    // Publish the import and completion marker together. Existing shared-table
+    // entries win, including ones written by another archive invocation.
+    let tx = db.unchecked_transaction()?;
+    for (path, identity, gear, max_speed) in &rows {
+        tx.execute("INSERT OR IGNORE INTO archive_driving_evidence
+            (path, identity, gear, max_speed) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![path, identity, gear, max_speed])?;
+    }
+    crate::schema::meta_set(&tx, LEGACY_IMPORT_MARKER, "complete")?;
+    tx.commit()?;
+    eprintln!("archive driving filter: imported {} legacy cache entries", rows.len());
+    Ok(())
+}
+
 fn filter_cached(
-    root: &Path, candidates: &str, min_speed_mps: f32, cache: &Path,
+    root: &Path, candidates: &str, min_speed_mps: f32, database: &Path, legacy: Option<&Path>,
     mut extract: impl FnMut(&Path) -> Result<DrivingEvidence>,
 ) -> Result<Vec<String>> {
-    let db = rusqlite::Connection::open(cache).context("Open archive driving cache")?;
-    db.busy_timeout(Duration::from_secs(5))?;
-    db.execute_batch("CREATE TABLE IF NOT EXISTS evidence_v1 (
-        path TEXT PRIMARY KEY, identity TEXT NOT NULL,
-        gear INTEGER NOT NULL, max_speed REAL NOT NULL
-    )")?;
+    let db = crate::db::open_connection(database).context("Open shared drive database")?;
+    crate::schema::migrate(&db)?;
+    // This is a dedicated worker connection. FULL makes per-file commits and
+    // the import marker durable without changing the server/telemetry handles.
+    db.pragma_update(None, "synchronous", "FULL")?;
+    if let Some(legacy) = legacy {
+        import_legacy_evidence(&db, legacy)?;
+    }
     let mut failure = None;
     let mut scanned = 0usize;
     let mut reused = 0usize;
@@ -110,7 +142,7 @@ fn filter_cached(
         let result = (|| -> Result<bool> {
             use rusqlite::OptionalExtension;
             let cached = db.query_row(
-                "SELECT gear, max_speed FROM evidence_v1 WHERE path=?1 AND identity=?2",
+                "SELECT gear, max_speed FROM archive_driving_evidence WHERE path=?1 AND identity=?2",
                 rusqlite::params![relative, identity],
                 |row| Ok(DrivingEvidence { gear: row.get(0)?, max_speed: row.get(1)? }),
             ).optional()?;
@@ -135,7 +167,7 @@ fn filter_cached(
                     return Ok(false);
                 }
                 // Autocommit each result so power loss retains completed scans.
-                db.execute("INSERT OR REPLACE INTO evidence_v1 VALUES (?1, ?2, ?3, ?4)",
+                db.execute("INSERT OR REPLACE INTO archive_driving_evidence (path, identity, gear, max_speed) VALUES (?1, ?2, ?3, ?4)",
                     rusqlite::params![relative, identity, evidence.gear, evidence.max_speed])?;
                 evidence
             };
@@ -151,13 +183,13 @@ fn filter_cached(
     // archive ledger and snapshot retention remove old candidates.
     let candidates: HashSet<&str> = candidates.lines().collect();
     let paths = {
-        let mut query = db.prepare("SELECT path FROM evidence_v1")?;
+        let mut query = db.prepare("SELECT path FROM archive_driving_evidence")?;
         let rows = query.query_map([], |row| row.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?
     };
     for path in paths {
         if !candidates.contains(path.as_str()) {
-            db.execute("DELETE FROM evidence_v1 WHERE path=?1", [path])?;
+            db.execute("DELETE FROM archive_driving_evidence WHERE path=?1", [path])?;
         }
     }
     eprintln!("archive driving filter: scanned {scanned} camera files, reused {reused} cached results");
@@ -167,11 +199,11 @@ fn filter_cached(
 /// Write only after all candidates have been classified. The caller replaces
 /// its candidate list only on success, so an I/O failure cannot allow unfiltered
 /// RecentClips through to an archive backend.
-pub fn filter_file(root: &Path, input: &Path, output: &Path, min_speed_mps: f32, cache: &Path) -> Result<()> {
+pub fn filter_file(root: &Path, input: &Path, output: &Path, min_speed_mps: f32, database: &Path, legacy_cache: &Path) -> Result<()> {
     anyhow::ensure!(min_speed_mps.is_finite() && min_speed_mps >= 0.0, "Minimum archive speed must be a finite, non-negative number");
     anyhow::ensure!(input != output, "archive filter input and output must differ");
     let candidates = std::fs::read_to_string(input).context("Read archive candidates")?;
-    let selected = filter_cached(root, &candidates, min_speed_mps, cache, read_evidence)?;
+    let selected = filter_cached(root, &candidates, min_speed_mps, database, Some(legacy_cache), read_evidence)?;
     let skipped = candidates.lines().count() - selected.len();
     eprintln!("archive driving filter: scan complete; keeping {} candidates, skipping {skipped}", selected.len());
     let mut result = selected.join("\n");
@@ -185,6 +217,86 @@ pub fn filter_file(root: &Path, input: &Path, output: &Path, min_speed_mps: f32,
 mod tests {
     use super::*;
 
+    fn legacy_cache(path: &Path) -> rusqlite::Connection {
+        let db = rusqlite::Connection::open(path).unwrap();
+        db.execute_batch("CREATE TABLE evidence_v1 (
+            path TEXT PRIMARY KEY, identity TEXT NOT NULL,
+            gear INTEGER NOT NULL, max_speed REAL NOT NULL
+        )").unwrap();
+        db
+    }
+
+    #[test]
+    fn imports_legacy_evidence_once_without_rescans_or_touching_shared_data() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("RecentClips")).unwrap();
+        let clip = "RecentClips/2026-10-24_12-00-00-front.mp4";
+        std::fs::write(root.path().join(clip), mp4(0, 2.0)).unwrap();
+        let legacy = root.path().join("legacy.sqlite");
+        let old = legacy_cache(&legacy);
+        old.execute("INSERT INTO evidence_v1 VALUES (?1, ?2, 0, 2.0)",
+            rusqlite::params![clip, source_identity(&root.path().join(clip)).unwrap()]).unwrap();
+        drop(old);
+        let before = std::fs::read(&legacy).unwrap();
+        let database = root.path().join("drives.db");
+        let db = crate::db::open_connection(&database).unwrap();
+        crate::schema::migrate(&db).unwrap();
+        db.execute("INSERT INTO processed_files VALUES ('existing.mp4', 123)", []).unwrap();
+        crate::schema::meta_set(&db, "unrelated_setting", "preserve").unwrap();
+        drop(db);
+        let no_reads = |_: &Path| -> Result<DrivingEvidence> { panic!("imported clip was rescanned") };
+        assert_eq!(filter_cached(root.path(), clip, 0.5, &database, Some(&legacy), no_reads).unwrap(), [clip]);
+        assert!(filter_cached(root.path(), clip, 3.0, &database, Some(&legacy), no_reads).unwrap().is_empty());
+        assert_eq!(std::fs::read(&legacy).unwrap(), before);
+        let db = crate::db::open_connection(&database).unwrap();
+        assert_eq!(crate::schema::meta_get(&db, "unrelated_setting").unwrap().as_deref(), Some("preserve"));
+        assert_eq!(db.query_row("SELECT added_at FROM processed_files WHERE file='existing.mp4'", [], |row| row.get::<_, i64>(0)).unwrap(), 123);
+        // A removed cache entry must not be resurrected by the retained legacy file.
+        db.execute("DELETE FROM archive_driving_evidence", []).unwrap();
+        import_legacy_evidence(&db, &legacy).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM archive_driving_evidence", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(db.query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0)).unwrap(), "ok");
+    }
+
+    #[test]
+    fn failed_import_rolls_back_entries_and_marker_and_can_retry() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy.sqlite");
+        let old = legacy_cache(&legacy);
+        old.execute_batch("INSERT INTO evidence_v1 VALUES ('a', 'id-a', 0, 0), ('b', 'id-b', 1, 2)").unwrap();
+        drop(old);
+        let db = crate::db::open_connection(root.path().join("drives.db")).unwrap();
+        crate::schema::migrate(&db).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_import BEFORE INSERT ON archive_driving_evidence
+            WHEN NEW.path='b' BEGIN SELECT RAISE(ABORT, 'synthetic write failure'); END;").unwrap();
+        assert!(import_legacy_evidence(&db, &legacy).is_err());
+        assert!(crate::schema::meta_get(&db, LEGACY_IMPORT_MARKER).unwrap().is_none());
+        assert_eq!(db.query_row("SELECT count(*) FROM archive_driving_evidence", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        db.execute_batch("DROP TRIGGER fail_import").unwrap();
+        // A newer shared entry must win over the old cache on retry.
+        db.execute_batch("INSERT INTO archive_driving_evidence VALUES ('a', 'new-id', 1, 5)").unwrap();
+        import_legacy_evidence(&db, &legacy).unwrap();
+        assert_eq!(db.query_row("SELECT identity FROM archive_driving_evidence WHERE path='a'", [], |row| row.get::<_, String>(0)).unwrap(), "new-id");
+        assert!(crate::schema::meta_get(&db, LEGACY_IMPORT_MARKER).unwrap().is_some());
+    }
+
+    #[test]
+    fn video_scan_does_not_hold_the_shared_database_writer_lock() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("RecentClips")).unwrap();
+        let clip = "RecentClips/2026-10-24_12-00-00-front.mp4";
+        std::fs::write(root.path().join(clip), mp4(1, 0.0)).unwrap();
+        let database = root.path().join("drives.db");
+        filter_cached(root.path(), clip, 0.5, &database, None, |_| {
+            let writer = crate::db::open_connection(&database)?;
+            writer.busy_timeout(Duration::ZERO)?;
+            writer.execute("INSERT INTO processed_files VALUES ('concurrent.mp4', 123)", [])?;
+            Ok(DrivingEvidence { gear: true, max_speed: 0.0 })
+        }).unwrap();
+        let db = crate::db::open_connection(&database).unwrap();
+        assert_eq!(db.query_row("SELECT count(*) FROM processed_files WHERE file='concurrent.mp4'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+    }
+
     #[test]
     fn persistent_cache_reuses_positive_and_negative_evidence_across_thresholds() {
         let root = tempfile::tempdir().unwrap();
@@ -195,21 +307,21 @@ mod tests {
         std::fs::write(root.path().join(parked), mp4(0, 0.0)).unwrap();
         let candidates = format!("{driving}\n{parked}\n");
         let cache = root.path().join("cache.sqlite");
-        assert_eq!(filter_cached(root.path(), &candidates, 0.5, &cache, read_evidence).unwrap(), [driving]);
+        assert_eq!(filter_cached(root.path(), &candidates, 0.5, &cache, None, read_evidence).unwrap(), [driving]);
         // Each call opens the on-disk database afresh, like a new process/boot.
         let no_reads = |_: &Path| -> Result<DrivingEvidence> { panic!("cached clip was rescanned") };
-        assert!(filter_cached(root.path(), &candidates, 3.0, &cache, no_reads).unwrap().is_empty());
-        assert_eq!(filter_cached(root.path(), &candidates, 0.0, &cache, no_reads).unwrap(), [driving]);
+        assert!(filter_cached(root.path(), &candidates, 3.0, &cache, None, no_reads).unwrap().is_empty());
+        assert_eq!(filter_cached(root.path(), &candidates, 0.0, &cache, None, no_reads).unwrap(), [driving]);
         // Changing a file invalidates its evidence; the unchanged parked file
         // still hits the cache. Use size to avoid filesystem timestamp precision.
         std::fs::write(root.path().join(driving), b"changed").unwrap();
         let mut reads = 0;
-        filter_cached(root.path(), &candidates, 0.5, &cache, |_| {
+        filter_cached(root.path(), &candidates, 0.5, &cache, None, |_| {
             reads += 1;
             Ok(DrivingEvidence { gear: true, max_speed: 0.0 })
         }).unwrap();
         assert_eq!(reads, 1);
-        assert_eq!(filter_cached(root.path(), &candidates, 100.0, &cache, no_reads).unwrap(), [driving]);
+        assert_eq!(filter_cached(root.path(), &candidates, 100.0, &cache, None, no_reads).unwrap(), [driving]);
     }
 
     #[test]
@@ -219,11 +331,11 @@ mod tests {
         let clip = "RecentClips/2026-10-24_12-00-00-front.mp4";
         std::fs::write(root.path().join(clip), mp4(1, 0.0)).unwrap();
         let cache = root.path().join("cache.sqlite");
-        assert!(filter_cached(root.path(), clip, 0.5, &cache, |_| anyhow::bail!("I/O failure")).unwrap().is_empty());
-        assert_eq!(filter_cached(root.path(), clip, 0.5, &cache, read_evidence).unwrap(), [clip]);
-        filter_cached(root.path(), "", 0.5, &cache, read_evidence).unwrap();
+        assert!(filter_cached(root.path(), clip, 0.5, &cache, None, |_| anyhow::bail!("I/O failure")).unwrap().is_empty());
+        assert_eq!(filter_cached(root.path(), clip, 0.5, &cache, None, read_evidence).unwrap(), [clip]);
+        filter_cached(root.path(), "", 0.5, &cache, None, read_evidence).unwrap();
         let db = rusqlite::Connection::open(&cache).unwrap();
-        assert_eq!(db.query_row("SELECT count(*) FROM evidence_v1", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+        assert_eq!(db.query_row("SELECT count(*) FROM archive_driving_evidence", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     }
 
     #[test]
@@ -238,10 +350,10 @@ mod tests {
         let link = root.path().join(clip);
         std::os::unix::fs::symlink(&a, &link).unwrap();
         let cache = root.path().join("cache.sqlite");
-        assert!(filter_cached(root.path(), clip, 0.5, &cache, read_evidence).unwrap().is_empty());
+        assert!(filter_cached(root.path(), clip, 0.5, &cache, None, read_evidence).unwrap().is_empty());
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&b, &link).unwrap();
-        assert_eq!(filter_cached(root.path(), clip, 0.5, &cache, read_evidence).unwrap(), [clip]);
+        assert_eq!(filter_cached(root.path(), clip, 0.5, &cache, None, read_evidence).unwrap(), [clip]);
     }
 
     #[test]
@@ -326,7 +438,7 @@ mod tests {
         let output = root.path().join("output");
         std::fs::write(&input, clip).unwrap();
         for invalid in [-1.0, f32::NAN, f32::INFINITY] {
-            assert!(filter_file(root.path(), &input, &output, invalid, &root.path().join("cache.sqlite")).is_err());
+            assert!(filter_file(root.path(), &input, &output, invalid, &root.path().join("cache.sqlite"), &root.path().join("legacy.sqlite")).is_err());
             assert!(!output.exists());
         }
     }

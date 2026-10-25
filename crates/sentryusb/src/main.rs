@@ -47,9 +47,12 @@ enum Command {
         /// Speed evidence threshold in metres per second; gear evidence is independent.
         #[arg(long, default_value_t = 0.5)]
         min_speed_mps: f32,
-        /// Persistent evidence cache; survives reboots and interrupted archives.
+        /// Shared drive database containing archive evidence.
+        #[arg(long, default_value = sentryusb_drives::DEFAULT_DB_PATH)]
+        database: std::path::PathBuf,
+        /// Previous standalone cache, imported once and left unchanged.
         #[arg(long, default_value = "/mutable/archive-driving-cache.sqlite")]
-        cache: std::path::PathBuf,
+        legacy_cache: std::path::PathBuf,
         #[arg(long)]
         root: std::path::PathBuf,
         #[arg(long)]
@@ -570,8 +573,8 @@ async fn shutdown_signal() {
 /// existing `ERROR: make_snapshot.sh failed (exit $?)` log lines stay useful.
 async fn run_subcommand(cmd: Command) -> i32 {
     match cmd {
-        Command::FilterArchiveRecentDriving { root, input, output, min_speed_mps, cache } => {
-            match sentryusb_drives::archive_filter::filter_file(&root, &input, &output, min_speed_mps, &cache) {
+        Command::FilterArchiveRecentDriving { root, input, output, min_speed_mps, database, legacy_cache } => {
+            match sentryusb_drives::archive_filter::filter_file(&root, &input, &output, min_speed_mps, &database, &legacy_cache) {
                 Ok(()) => 0,
                 Err(error) => { eprintln!("archive driving filter: {error:#}"); 1 },
             }
