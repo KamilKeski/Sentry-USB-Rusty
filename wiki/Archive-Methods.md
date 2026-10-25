@@ -22,6 +22,14 @@ The configuration setting is `ARCHIVE_RECENTCLIPS_DRIVING_ONLY=true` alongside
 The threshold is stored in metres per second as `ARCHIVE_RECENTCLIPS_MIN_SPEED_MPS`
 and accepts finite, non-negative values, including zero.
 Reading metadata adds work before transfers, especially on lower-powered Pis.
+Successful camera-file scans are cached in `/mutable/archive-driving-cache.sqlite`,
+including parked and metadata-free results. Subsequent cycles check file metadata
+and reuse evidence for unchanged files instead of reading their video again.
+Changing the speed threshold reuses the stored gear and maximum-speed evidence.
+New or changed files are scanned; read failures are retried on the next cycle.
+Results are committed as each scan finishes so reboots or interrupted archives
+retain completed work. Entries are pruned when files leave the archive candidate
+list. The first cycle after installing this feature still needs to build the cache.
 
 ## CIFS / SMB
 
