@@ -1,5 +1,5 @@
 //! Archive selection based on the recording car's embedded SEI telemetry.
-use std::{collections::{HashMap, HashSet}, path::{Component, Path}};
+use std::{collections::{BTreeMap, HashSet}, path::{Component, Path}, time::{Duration, Instant}};
 use anyhow::{Context, Result};
 use crate::{extract::extract_gps_from_file, grouper::telemetry_has_driving};
 
@@ -7,7 +7,14 @@ use crate::{extract::extract_gps_from_file, grouper::telemetry_has_driving};
 /// proves driving. Other archive categories pass through unchanged. Missing,
 /// corrupt and metadata-free recordings never qualify on their own.
 pub fn filter_driving_recent(root: &Path, candidates: &str, min_speed_mps: f32) -> Vec<String> {
+    let mut scanned = 0usize;
+    let mut last_report = Instant::now();
     filter_with(candidates, |relative| {
+        if scanned == 0 || last_report.elapsed() >= Duration::from_secs(15) {
+            eprintln!("archive driving filter: scanned {scanned} camera files; reading {relative}");
+            last_report = Instant::now();
+        }
+        scanned += 1;
         match extract_gps_from_file(&root.join(relative).to_string_lossy()) {
             Ok(data) => telemetry_has_driving(
                 &data.gear_runs, &data.gear_states, &[],
@@ -32,7 +39,9 @@ fn recording_key(relative: &str) -> Option<String> {
 }
 
 fn filter_with(candidates: &str, mut driving: impl FnMut(&str) -> bool) -> Vec<String> {
-    let mut groups: HashMap<String, Vec<&str>> = HashMap::new();
+    // Nearby recording timestamps usually share a snapshot. Random hash-map
+    // iteration revisits automounts and scatters reads across backing images.
+    let mut groups: BTreeMap<String, Vec<&str>> = BTreeMap::new();
     for line in candidates.lines().filter(|line| line.starts_with("RecentClips/")) {
         if let Some(key) = recording_key(line) { groups.entry(key).or_default().push(line); }
     }
@@ -57,6 +66,7 @@ pub fn filter_file(root: &Path, input: &Path, output: &Path, min_speed_mps: f32)
     let candidates = std::fs::read_to_string(input).context("Read archive candidates")?;
     let selected = filter_driving_recent(root, &candidates, min_speed_mps);
     let skipped = candidates.lines().count() - selected.len();
+    eprintln!("archive driving filter: scan complete; keeping {} candidates, skipping {skipped}", selected.len());
     let mut result = selected.join("\n");
     if !result.is_empty() { result.push('\n'); }
     std::fs::write(output, result).context("Write filtered archive candidates")?;
@@ -67,6 +77,19 @@ pub fn filter_file(root: &Path, input: &Path, output: &Path, min_speed_mps: f32)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scans_recordings_in_order_but_preserves_candidate_output_order() {
+        let later = "RecentClips/2026-10-24_13-00-00-front.mp4";
+        let earlier = "RecentClips/2026-10-24_12-00-00-front.mp4";
+        let mut scanned = Vec::new();
+        let selected = filter_with(&format!("{later}\n{earlier}\n"), |path| {
+            scanned.push(path.to_owned());
+            true
+        });
+        assert_eq!(scanned, [earlier, later]);
+        assert_eq!(selected, [later, earlier]);
+    }
 
     #[test]
     fn keeps_all_angles_of_driving_recordings_and_other_categories() {
