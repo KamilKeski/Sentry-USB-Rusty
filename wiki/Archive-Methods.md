@@ -21,6 +21,17 @@ The configuration setting is `ARCHIVE_RECENTCLIPS_DRIVING_ONLY=true` alongside
 `ARCHIVE_RECENTCLIPS=true`. It defaults to `false` for existing installations.
 The threshold is stored in metres per second as `ARCHIVE_RECENTCLIPS_MIN_SPEED_MPS`
 and accepts finite, non-negative values, including zero.
+
+For manual edits, convert mph to m/s by multiplying by `0.44704`, or divide
+km/h by `3.6`. For example, **5 mph = 2.2352 m/s**:
+
+```bash
+export ARCHIVE_RECENTCLIPS_MIN_SPEED_MPS=2.2352
+```
+
+You do not need long decimal values: `2.24` is a practical approximation of
+5 mph. The Setup Wizard handles these conversions automatically.
+
 Reading metadata adds work before transfers, especially on lower-powered Pis.
 Successful camera-file scans are cached in the `archive_driving_evidence` table
 of the shared `/backingfiles/drive-data.db`, including parked and metadata-free
