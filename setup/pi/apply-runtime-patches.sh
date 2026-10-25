@@ -1629,6 +1629,19 @@ apply_archive_runtime() {
 
 # ── Run all patches ─────────────────────────────────────────────────────
 
+apply_status_led_cleanup() {
+    local binary=/opt/sentryusb/sentryusb
+    [ -x /opt/sentryusb/sentryusb-current ] && binary=/opt/sentryusb/sentryusb-current
+    [ -x "$binary" ] || return 0
+    "$binary" --help 2>/dev/null | grep -q 'status-led-restore' || return 0
+    local dir=/etc/systemd/system/sentryusb.service.d
+    [ -x /root/bin/remountfs_rw ] && /root/bin/remountfs_rw >/dev/null 2>&1 || true
+    mkdir -p "$dir" || return 1
+    printf '[Service]\nExecStopPost=-%s status-led-restore\n' "$binary" > "$dir/status-led.conf" || return 1
+    systemctl daemon-reload 2>/dev/null || true
+    log "status-led: abnormal-exit cleanup installed"
+}
+
 # The offline refresh comes first; then cap inode reserves to prevent data loss
 # on single-disk installs
 # running v3.20.0-v3.20.8, and the updater bounds this whole script
@@ -1636,6 +1649,7 @@ apply_archive_runtime() {
 # let the device reboot onto the uncapped scripts and keep deleting
 # snapshots. It is two small awk passes, so it costs nothing here.
 run_patch apply_archive_runtime
+run_patch apply_status_led_cleanup
 run_patch apply_inode_reserve_cap
 run_patch apply_ble_nonfatal_adv
 run_patch apply_ble_adv_helper

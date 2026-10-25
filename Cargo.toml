@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/sentryusb",
+    "crates/status_led",
     "crates/ble_health",
     "crates/config",
     "crates/vehicle_profile",

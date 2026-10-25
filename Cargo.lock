@@ -2608,6 +2608,7 @@ dependencies = [
  "sentryusb-gadget",
  "sentryusb-setup",
  "sentryusb-shell",
+ "sentryusb-status-led",
  "sentryusb-ws",
  "tokio",
  "tower-http 0.7.1",
@@ -2736,6 +2737,7 @@ dependencies = [
  "ring",
  "sentryusb-config",
  "sentryusb-shell",
+ "sentryusb-status-led",
  "tempfile",
  "tokio",
  "tracing",
@@ -2781,6 +2783,16 @@ dependencies = [
  "anyhow",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "sentryusb-status-led"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

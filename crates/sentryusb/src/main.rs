@@ -42,6 +42,8 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Restore LED triggers after an abnormal server exit (systemd cleanup).
+    StatusLedRestore,
     /// Refresh only bundled archive scripts; does not restart services or run setup.
     RefreshArchiveScripts {
         #[arg(long, default_value = "/root/bin")]
@@ -151,6 +153,11 @@ async fn main() {
 
     info!("SentryUSB server starting on port {}", args.port);
 
+    // Only the server owns LEDs; short-lived gadget/snapshot commands do not.
+    let led = if args.dev { None } else {
+        sentryusb_status_led::Controller::start(|| sentryusb_gadget::validate_storage().is_ok())
+    };
+
     sentryusb_api::device_reporting::spawn();
 
     // Run startup migration in background
@@ -219,7 +226,9 @@ async fn main() {
                 db_path,
                 e
             );
-            tokio::spawn(async {
+            if let Some(led) = &led { led.fault(); }
+            let recovery_led = led.clone();
+            tokio::spawn(async move {
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 tick.tick().await; // skip the immediate tick
                 loop {
@@ -233,6 +242,7 @@ async fn main() {
                         tracing::info!(
                             "drive DB opens again — exiting degraded mode; systemd restarts into normal service"
                         );
+                        if let Some(led) = &recovery_led { led.stop(); }
                         std::process::exit(0);
                     }
                 }
@@ -243,7 +253,7 @@ async fn main() {
                 reason: std::sync::Arc::new(format!("{e:#}")),
             };
             let app = sentryusb_api::degraded::build_degraded_router(degraded);
-            serve_with_common_layers(app, auth, args.port, args.dev, t0).await;
+            serve_with_common_layers(app, auth, args.port, args.dev, t0, led).await;
             return;
         }
     };
@@ -371,7 +381,7 @@ async fn main() {
     let app = sentryusb_api::build_router(app_state.clone());
     phase!("router_built");
 
-    serve_with_common_layers(app, auth, args.port, args.dev, t0).await;
+    serve_with_common_layers(app, auth, args.port, args.dev, t0, led).await;
 }
 
 /// Shared serving tail for normal and degraded startup: media mounts,
@@ -383,6 +393,7 @@ async fn serve_with_common_layers(
     port: u16,
     dev: bool,
     t0: std::time::Instant,
+    led: Option<sentryusb_status_led::Controller>,
 ) {
     // Serve TeslaCam video files via the bind mount of /mutable/TeslaCam
     // at /var/www/html/TeslaCam. Modern browsers (Chrome 80+, Firefox 70+,
@@ -498,6 +509,8 @@ async fn serve_with_common_layers(
         .await
         .expect("failed to bind address");
     info!(boot_phase = "listener_bound", elapsed_ms = t0.elapsed().as_millis() as u64);
+    // This cannot clear a degraded-mode fault. USB/storage/worker gates are separate.
+    if let Some(led) = &led { led.ready(); }
 
     info!(
         boot_phase = "ready",
@@ -512,7 +525,12 @@ async fn serve_with_common_layers(
     )
     .with_graceful_shutdown({
         let draining = draining.clone();
-        async move { shutdown_signal().await; draining.notify_one(); }
+        let led = led.clone();
+        async move {
+            shutdown_signal().await;
+            if let Some(led) = &led { led.stop(); }
+            draining.notify_one();
+        }
     });
     // The drain waits on every in-flight request (downloads, the archive
     // loop's post-archive update handoff), which otherwise held reboots until
@@ -555,6 +573,7 @@ async fn shutdown_signal() {
 /// existing `ERROR: make_snapshot.sh failed (exit $?)` log lines stay useful.
 async fn run_subcommand(cmd: Command) -> i32 {
     match cmd {
+        Command::StatusLedRestore => { sentryusb_status_led::restore(); 0 }
         Command::RefreshArchiveScripts { directory } => {
             let result = sentryusb_setup::archive_runtime::refresh_configured(&directory);
             match result {

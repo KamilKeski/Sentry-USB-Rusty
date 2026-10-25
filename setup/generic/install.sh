@@ -27,22 +27,7 @@ function error_exit {
 }
 
 function flash_rapidly {
-  for led in /sys/class/leds/*
-  do 
-    if [ -e "$led/trigger" ]
-    then
-      if ! grep -q timer "$led/trigger"
-      then
-        modprobe ledtrig-timer || echo "timer LED trigger unavailable"
-      fi
-      echo timer > "$led/trigger" || true
-      if [ -e "$led/delay_off" ]
-      then
-        echo 150 > "$led/delay_off" || true
-        echo 50 > "$led/delay_on" || true
-      fi
-    fi
-  done
+  echo "Installation is ready; continue in the Sentry USB setup wizard."
 }
 
 rootpart=$(findmnt -n -o SOURCE /)
@@ -255,5 +240,5 @@ then
 fi
 
 
-# blink the LEDs to signal the install half is done; setup continues in the web wizard
+# Setup continues in the web wizard; the server owns runtime LED indications.
 flash_rapidly

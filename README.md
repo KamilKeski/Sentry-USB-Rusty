@@ -112,6 +112,14 @@ Plus a **high-quality MicroSD card sized for the storage layout you choose** and
 
 ---
 
+## Status light
+
+After Linux boots, Sentry USB uses the Pi's existing activity light to show startup, USB connection, camera-disk writes and application faults. The Pi's firmware boot and error codes remain unchanged. Different colours are for **Pi 5 only**; other supported boards use the same blink patterns and meanings.
+
+See the [status-light wiki guide](https://github.com/Sentry-Six/Sentry-USB-Rusty/wiki/Status-LED) for **live blinking examples**, the status table and limitations.
+
+---
+
 ## Privacy
 
 By default, Sentry USB sends **no device identifier** to our servers. Here's everything it ever sends:

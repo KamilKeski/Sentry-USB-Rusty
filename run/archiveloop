@@ -1,4 +1,5 @@
 #!/bin/bash -eu
+# sentryusb-status-led: cooperative-v1
 
 if [ "${BASH_SOURCE[0]}" != "$0" ]
 then
@@ -65,6 +66,24 @@ fi
 export CAM_MOUNT=/mnt/cam
 export MUSIC_MOUNT=/mnt/music
 
+# Advisory only: bind status to the worker PID/start time. The Rust server
+# owns LED hardware, and a dead/reused PID must never leave a healthy light.
+function status_led_archive () {
+  (
+    umask 077
+    local dir=/run/sentryusb-led record
+    local -a fields
+    mkdir -p -m 700 "$dir" || exit 0
+    record=$(cat "/proc/$$/stat") || exit 0
+    record=${record##*) }
+    read -r -a fields <<< "$record"
+    [ -n "${fields[19]:-}" ] || exit 0
+    printf '%s %s %s\n' "$$" "${fields[19]}" "$1" > "$dir/archive.$$.new" &&
+      mv -f "$dir/archive.$$.new" "$dir/archive"
+  ) 2>/dev/null || true
+}
+status_led_archive starting
+
 # read the setup variables and define other environment variables and functions
 source /root/bin/envsetup.sh
 source /root/bin/archive-control.sh
@@ -86,7 +105,7 @@ source /root/bin/system-temperature.sh
 # That also covers a mid-cycle toggle: enabling Travel Mode between
 # awake_start and awake_stop still kills the nudge loop instead of
 # leaving it nudging the car every 5 minutes for the rest of the trip.
-trap 'archive_cycle_end; clear_archive_status; /root/bin/awake_stop || true' EXIT
+trap 'status_led_archive fault; archive_cycle_end; clear_archive_status; /root/bin/awake_stop || true' EXIT
 
 # Reason passed to awake_start so nudge log lines show what is keeping the car awake.
 export KEEP_AWAKE_REASON=Archive
@@ -94,17 +113,6 @@ export KEEP_AWAKE_REASON=Archive
 # any existing nudge loop before starting a new one, so only one BLE
 # nudge process runs at a time (prevents hci0 contention).
 export KEEP_AWAKE_PID_FILE=/tmp/keep_awake_nudge_pid
-
-# led triggers may have been built as modules, so try
-# to load them
-if ! grep -q timer "$STATUSLED/trigger"
-then
-  modprobe ledtrig-timer || log "timer LED trigger unavailable"
-fi
-if ! grep -q heartbeat "$STATUSLED/trigger"
-then
-  modprobe ledtrig-heartbeat || log "heartbeat LED trigger unavailable" 
-fi
 
 if [ -z "${ARCHIVE_SERVER+x}" ]
 then
@@ -465,6 +473,7 @@ function connect_usb_drives_to_host() {
 }
 
 function connect_usb_drives_to_host_locked() {
+  status_led_archive working 2>/dev/null || true
   clear_archive_status
   if ! usb_storage_ready; then
     log "ERROR: USB storage is not ready; not presenting an empty drive"
@@ -521,6 +530,7 @@ function connect_usb_drives_to_host_locked() {
     return "$result"
   fi
   log "Connected usb to host."
+  status_led_archive ready 2>/dev/null || true
   sleep 5
 }
 
@@ -1215,6 +1225,7 @@ function disconnect_usb_drives_from_host () {
 }
 
 function disconnect_usb_drives_from_host_locked () {
+  status_led_archive working 2>/dev/null || true
   log "Disconnecting usb from host..."
   if /root/bin/disable_gadget.sh
   then
@@ -2143,6 +2154,7 @@ function wait_for_usb_storage () {
 
 function connect_usb_at_startup () {
   until connect_usb_drives_to_host; do
+    status_led_archive fault 2>/dev/null || true
     log "USB startup did not complete; retrying in 10 seconds"
     sleep 10
     wait_for_usb_storage
@@ -2373,24 +2385,6 @@ function archive_clips () {
   /root/bin/disconnect-archive.sh 2>> "$LOG_FILE" || ARCHIVE_ALL_STAGES_OK=0
 
   [ "$clips_ok" = "true" ]
-}
-
-function slowblink () {
-  echo timer > "$STATUSLED/trigger" || return 0
-  echo 900 > "$STATUSLED/delay_off"
-  echo 100 > "$STATUSLED/delay_on"
-}
-
-function fastblink () {
-  echo timer > "$STATUSLED/trigger" || return 0
-  echo 150 > "$STATUSLED/delay_off"
-  echo 50 > "$STATUSLED/delay_on"
-}
-
-
-function doubleblink () {
-  echo heartbeat > "$STATUSLED/trigger" || return 0
-  echo 0 > "$STATUSLED/invert"
 }
 
 # Write system time → RTC via /dev/rtc0 ioctl (Pi 5 only)
@@ -3118,6 +3112,7 @@ wait_for_usb_storage
 if travel_mode_active && usb_gadget_is_active
 then
   log "Travel Mode: USB gadget still bound at startup (service restart) — keeping it connected; skipping boot-time fsck, cleaning and gadget cycle"
+  status_led_archive ready
   # a crashed run may have left a stale in-progress marker
   clear_archive_status
   if has_cam_disk
@@ -3147,6 +3142,7 @@ else
   # synced inside connect (before enable), so the car still sees a single
   # plug-in with everything already in place.
   connect_usb_at_startup
+  status_led_archive ready
 
   if has_cam_disk
   then
@@ -3162,7 +3158,7 @@ fi
 
 if archive_is_reachable
 then
-  fastblink
+  status_led_archive working
 
   set_time
 
@@ -3194,7 +3190,7 @@ then
   auto_update_after_archive || log "Automatic update handoff failed"
   /root/bin/awake_stop || true
 
-  doubleblink
+  status_led_archive ready
 
   # archive_clips already ensured when needed; do not force another full cycle.
   if archive_is_reachable && ! travel_mode_active; then
@@ -3208,11 +3204,11 @@ fi
 
 while true
 do
-  slowblink
+  status_led_archive ready
 
   wait_for_archive_to_be_reachable
 
-  fastblink
+  status_led_archive working
 
   set_time
 
@@ -3250,7 +3246,7 @@ do
   auto_update_after_archive || log "Automatic update handoff failed"
   /root/bin/awake_stop || true
 
-  doubleblink
+  status_led_archive ready
 
   if archive_is_reachable && ! travel_mode_active; then
     ensure_usb_drives_connected || log "ERROR: failed to ensure USB gadget after archive cycle"

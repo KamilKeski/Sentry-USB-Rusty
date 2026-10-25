@@ -162,6 +162,7 @@ fn validate_storage_at(mounts: &str, root: &Path, require_cam: bool) -> Result<(
 
 /// Enable the USB gadget through configfs.
 pub fn enable() -> Result<()> {
+    let _led_transition = sentryusb_status_led::MediaTransition::begin();
     validate_storage()?;
     let configfs = find_configfs_root()?;
     let gadget = configfs.join("usb_gadget").join(GADGET_NAME);
@@ -337,6 +338,7 @@ fn bind_udc(gadget: &Path) -> Result<()> {
 
 /// Disable the USB gadget by tearing down configfs.
 pub fn disable() -> Result<()> {
+    let _led_transition = sentryusb_status_led::MediaTransition::begin();
     // Release the UDC from g_mass_storage before deactivating configfs.
     let _ = std::process::Command::new("modprobe")
         .args(["-q", "-r", "g_mass_storage"])
