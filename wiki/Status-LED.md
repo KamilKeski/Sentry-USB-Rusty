@@ -21,6 +21,39 @@ light, that light stays under the Pi's control.
 | Recent camera-disk writes | Green | Quick pulses: 400 ms on, 100 ms off |
 | Needs attention | Red | Mostly lit, with a brief dark dip every three seconds |
 
+These examples describe the **visible application pattern**: connected is mostly
+dark with two short green flashes, and amber means red and green lit together.
+There is no application status that deliberately alternates red and green.
+
+### Pi 5: inverted flashes or alternating red and green
+
+The Pi 5 normally stays green and flashes off for microSD activity when Linux
+controls the LED. Raspberry Pi implements this by deliberately inverting the
+green channel's brightness interface. The original Sentry USB LED controller
+did not compensate for that inversion, so its visible output could differ from
+the examples above:
+
+| Intended application pattern | Original controller on a stock Pi 5 |
+| --- | --- |
+| Slow amber pulse during startup | Red for one second, then green for one second |
+| Fast amber pulse while preparing | Red for 250 ms, then green for 250 ms |
+| Two green flashes when connected | Green most of the time, with two short dark dips |
+
+This is a polarity error, not an extra status code. The corrected controller
+reads the Pi 5's effective LED polarity and compensates only for its green
+channel. It also respects an existing `act_led_activelow=off` override without
+changing boot configuration. Other boards keep their normal brightness mapping.
+If the Pi 5's GPIO description is missing or unsupported, application LED control
+stays unavailable and logs the reason instead of guessing the polarity.
+
+These symptoms match the known Pi 5 behaviour, but do not identify an unknown
+board or software version. If red/green alternation continues with the correction,
+record the Pi model, Sentry USB version, kernel version and whether USB is
+connected; changes between application states can also change the colour.
+See [Raspberry Pi's explanation of the inverted green channel](https://github.com/raspberrypi/linux/issues/6783).
+
+### What the signals establish
+
 The double blink means normal server startup completed, the archive worker is
 alive, storage is usable, and the USB host configured the presented drive. It
 does not certify BLE, archive/cloud transfers or the contents of recorded video.
