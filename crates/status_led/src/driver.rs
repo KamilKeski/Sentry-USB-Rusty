@@ -172,9 +172,8 @@ fn pi5_activity_inverted(paths: &Paths) -> io::Result<bool> {
         }
         Err(e) => return Err(e),
     };
-    // One phandle and the two GPIO cells, all big-endian. Only the onboard
-    // GPIO 9 with ordinary high/low flags is supported; do not guess for a
-    // remapped GPIO or a different LED driver.
+    // One phandle and the two GPIO cells, all big-endian. GPIO offsets are
+    // controller-local: pin 9 alone does not identify the onboard circuit.
     if gpios.len() != 12 {
         return Err(io::Error::other("unrecognized Pi 5 ACT GPIO description"));
     }
@@ -182,6 +181,29 @@ fn pi5_activity_inverted(paths: &Paths) -> io::Result<bool> {
     let flags = u32::from_be_bytes(gpios[8..12].try_into().unwrap());
     if pin != 9 || flags > 1 {
         return Err(io::Error::other("unsupported Pi 5 ACT GPIO or polarity"));
+    }
+    // Resolve the reference against the effective phandle of BCM2712's known
+    // gio_aon node, not a compiled-in phandle or an arbitrary GPIO provider.
+    // The path, register range and binding are from bcm2712.dtsi; downstream
+    // bcm2712-ds.dtsi retains brcm,brcmstb-gpio. Decline unknown layouts.
+    let controller = paths
+        .model
+        .with_file_name("soc@107c000000")
+        .join("gpio@7d517c00");
+    let phandle = u32::from_be_bytes(gpios[..4].try_into().unwrap());
+    let compatible = fs::read(controller.join("compatible"))?;
+    if phandle == 0
+        || phandle == u32::MAX
+        || fs::read(controller.join("phandle"))? != gpios[..4]
+        || fs::read(controller.join("#gpio-cells"))? != 2u32.to_be_bytes()
+        || !fs::read(controller.join("gpio-controller"))?.is_empty()
+        || fs::read(controller.join("reg"))?
+            != [0x7d517c00u32.to_be_bytes(), 0x40u32.to_be_bytes()].concat()
+        || !compatible
+            .split_inclusive(|b| *b == 0)
+            .any(|name| name == b"brcm,brcmstb-gpio\0")
+    {
+        return Err(io::Error::other("unsupported Pi 5 ACT GPIO controller"));
     }
     Ok(flags == 1)
 }
@@ -290,18 +312,20 @@ mod tests {
         let r = d.path();
         let p = Paths {
             leds: r.join("leds"),
-            model: r.join("model"),
+            model: r.join("dt/model"),
             run: r.join("run"),
             proc: r.join("proc"),
             archive_script: r.join("archiveloop"),
             ..Paths::default()
         };
         fs::create_dir_all(&p.proc).unwrap();
+        fs::create_dir_all(p.model.parent().unwrap()).unwrap();
         fs::write(&p.model, model).unwrap();
         led(&p.leds.join("ACT"));
         led(&p.leds.join("PWR"));
         if model.starts_with("Raspberry Pi 5 Model B") {
             pi5_gpio(&p, 9, 1);
+            pi5_controller(&p, 7);
         }
         (d, p)
     }
@@ -316,6 +340,112 @@ mod tests {
             .flat_map(u32::to_be_bytes)
             .collect();
         fs::write(node.join("gpios"), cells).unwrap();
+    }
+    fn cells(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+    fn pi5_controller(p: &Paths, phandle: u32) -> std::path::PathBuf {
+        // BCM2712's gio_aon, from bcm2712.dtsi and bcm2712-ds.dtsi.
+        let node = p
+            .model
+            .parent()
+            .unwrap()
+            .join("soc@107c000000/gpio@7d517c00");
+        fs::create_dir_all(&node).unwrap();
+        fs::write(node.join("phandle"), cells(&[phandle])).unwrap();
+        fs::write(node.join("compatible"), b"brcm,brcmstb-gpio\0").unwrap();
+        fs::write(node.join("gpio-controller"), b"").unwrap();
+        fs::write(node.join("#gpio-cells"), cells(&[2])).unwrap();
+        fs::write(node.join("reg"), cells(&[0x7d517c00, 0x40])).unwrap();
+        node
+    }
+    fn gpio_source(p: &Paths, live_dt: bool) -> std::path::PathBuf {
+        let sysfs = p.leds.join("ACT/of_node/gpios");
+        if !live_dt {
+            return sysfs;
+        }
+        let node = p.model.parent().unwrap().join("leds/led-act");
+        fs::create_dir_all(&node).unwrap();
+        fs::rename(sysfs, node.join("gpios")).unwrap();
+        node.join("gpios")
+    }
+    fn assert_native_control(p: &Paths) {
+        assert!(Driver::claim(p).is_err());
+        assert!(!p.run.join("restore.json").exists());
+        for name in ["ACT", "PWR"] {
+            assert_eq!(
+                fs::read_to_string(p.leds.join(name).join("trigger")).unwrap(),
+                "none [mmc0] timer"
+            );
+            assert_eq!(brightness(p, name), "0");
+        }
+    }
+    #[test]
+    fn pi5_other_gpio_controller_pin_nine_is_rejected() {
+        for live_dt in [false, true] {
+            let (_d, p) = fixture("Raspberry Pi 5 Model B");
+            let other = p.model.parent().unwrap().join("axi/pcie/rp1/gpio@d0000");
+            fs::create_dir_all(&other).unwrap();
+            fs::write(other.join("phandle"), cells(&[11])).unwrap();
+            fs::write(other.join("compatible"), b"raspberrypi,rp1-gpio\0").unwrap();
+            fs::write(other.join("gpio-controller"), b"").unwrap();
+            fs::write(other.join("#gpio-cells"), cells(&[2])).unwrap();
+            let source = gpio_source(&p, live_dt);
+            fs::write(source, cells(&[11, 9, 1])).unwrap();
+            assert_native_control(&p);
+        }
+    }
+    #[test]
+    fn pi5_unresolved_gpio_controller_is_rejected() {
+        for live_dt in [false, true] {
+            let (_d, p) = fixture("Raspberry Pi 5 Model B");
+            let source = gpio_source(&p, live_dt);
+            fs::write(source, cells(&[987, 9, 1])).unwrap();
+            assert_native_control(&p);
+        }
+    }
+    #[test]
+    fn pi5_invalid_controller_identity_or_cell_layout_is_rejected() {
+        for live_dt in [false, true] {
+            for (property, data) in [
+                ("compatible", Some(b"raspberrypi,rp1-gpio\0".to_vec())),
+                ("#gpio-cells", Some(cells(&[3]))),
+                ("#gpio-cells", Some(vec![2])),
+                ("reg", Some(cells(&[0x7d508500, 0x40]))),
+                ("gpio-controller", None),
+                ("phandle", None),
+                ("phandle", Some(vec![7])),
+            ] {
+                let (_d, p) = fixture("Raspberry Pi 5 Model B");
+                let node = pi5_controller(&p, 7);
+                gpio_source(&p, live_dt);
+                match data {
+                    Some(bytes) => fs::write(node.join(property), bytes).unwrap(),
+                    None => fs::remove_file(node.join(property)).unwrap(),
+                }
+                assert_native_control(&p);
+            }
+        }
+    }
+    #[test]
+    fn pi5_controller_phandle_is_resolved_from_the_effective_tree() {
+        for live_dt in [false, true] {
+            for phandle in [7, 42, 0x1234] {
+                for active_low in [0, 1] {
+                    let (_d, p) = fixture("Raspberry Pi 5 Model B");
+                    pi5_controller(&p, phandle);
+                    let source = gpio_source(&p, live_dt);
+                    fs::write(source, cells(&[phandle, 9, active_low])).unwrap();
+                    let mut owner = Driver::claim(&p).unwrap().unwrap();
+                    let frame = Frame {
+                        green: true,
+                        red: true,
+                    };
+                    owner.set(frame).unwrap();
+                    assert_eq!(visible_pi5(&p, active_low == 1), frame);
+                }
+            }
+        }
     }
     fn visible_pi5(p: &Paths, active_low: bool) -> Frame {
         // Model the Pi 5 onboard circuit: green is electrically active-high;
