@@ -239,6 +239,10 @@ pub async fn install_runtime_scripts(emitter: &crate::SetupEmitter) -> Result<bo
             .unwrap_or(false)
     });
     if all_current {
+        // A previous setup may have installed the scripts while the tool
+        // download was unavailable. Retry that independent preparation even
+        // when there are no script changes to install.
+        prepare_xfs_repair_tool(emitter).await;
         return Ok(false);
     }
 
@@ -256,13 +260,18 @@ pub async fn install_runtime_scripts(emitter: &crate::SetupEmitter) -> Result<bo
         let _ = std::os::unix::fs::symlink("/root/bin/mountimage", "/sbin/mount.sentryusb");
     }
 
-    // Prepare on the root card while setup has it writable. Repair can then
-    // work offline even when the external backingfiles filesystem is down.
+    prepare_xfs_repair_tool(emitter).await;
+    emitter.progress("Runtime scripts installed.");
+    Ok(true)
+}
+
+// Prepare on the root card while setup has it writable. Repair can then work
+// offline even when the external backingfiles filesystem is down. Failure is
+// nonfatal, and a later setup run must be able to retry it.
+async fn prepare_xfs_repair_tool(emitter: &crate::SetupEmitter) {
     if let Err(error) = sentryusb_shell::run_with_timeout(std::time::Duration::from_secs(240), "python3", &[
         "/root/bin/xfs-repair-tool.py", "--cache-persistent",
     ]).await {
         emitter.progress(&format!("XFS repair tool preparation deferred: {error}. Repair may need internet access."));
     }
-    emitter.progress("Runtime scripts installed.");
-    Ok(true)
 }

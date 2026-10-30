@@ -372,6 +372,7 @@ jobs:
         run: cargo test --workspace --locked
       - name: Run installer safety regressions
         run: |
+          python3 test/xfs-repair-tool.test.py
           bash test/install-pi-safety.test.sh
           bash test/sentryusb-pick-binary.test.sh
           bash test/ble-setup-recovery.test.sh

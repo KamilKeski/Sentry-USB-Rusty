@@ -7,6 +7,7 @@ import unittest
 import hashlib
 import io
 import os
+import json
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("repair_tool", Path(__file__).resolve().parents[1] / "run/xfs-repair-tool.py")
@@ -40,9 +41,18 @@ class RepairToolTests(unittest.TestCase):
     def test_native_selection_does_not_download(self):
         with tempfile.TemporaryDirectory() as d:
             binary = Path(d) / "xfs_repair"
-            binary.write_bytes(elf(32, 40))
             with patch.object(tool, "prepare_bundle", side_effect=AssertionError("network")):
-                self.assertEqual(tool.select_tool("armv7l", binary, Path(d)), [str(binary)])
+                for kernel, bits, machine in [('armv6l', 32, 40), ('armv7l', 32, 40),
+                                               ('aarch64', 64, 183), ('x86_64', 64, 62),
+                                               ('i686', 32, 3)]:
+                    with self.subTest(kernel=kernel):
+                        binary.write_bytes(elf(bits, machine))
+                        self.assertEqual(tool.select_tool(kernel, binary, Path(d)), [str(binary)])
+
+    def test_missing_native_tool_on_32bit_fails_without_downloading_arm64(self):
+        with patch.object(tool, 'prepare_bundle', side_effect=AssertionError('wrong architecture')):
+            with self.assertRaisesRegex(RuntimeError, 'install native xfsprogs'):
+                tool.select_tool('armv7l', None, Path('/unused'))
 
     def test_mixed_arm_uses_bundle_and_never_falls_back(self):
         with tempfile.TemporaryDirectory() as d:
@@ -78,6 +88,17 @@ class RepairToolTests(unittest.TestCase):
                 command = tool.prepare_bundle(Path(d))
             with patch.object(tool.urllib.request, 'urlopen', side_effect=AssertionError('offline')):
                 self.assertEqual(tool.prepare_bundle(Path(d)), command)
+                # Existing installs boot read-only. A valid persistent cache
+                # must work without opening its write lock or using /run.
+                volatile = Path(d) / 'unused-volatile'
+                with patch.object(tool, 'PERSISTENT', Path(d)), patch.object(tool, 'VOLATILE', volatile), \
+                     patch.object(tool.platform, 'machine', return_value='aarch64'), \
+                     patch.object(tool.shutil, 'which', return_value=None), \
+                     patch.object(tool.os, 'access', return_value=False), \
+                     patch.object(tool.sys, 'stdout', new_callable=io.StringIO) as stdout:
+                    tool.main()
+                    self.assertEqual(json.loads(stdout.getvalue()), command)
+                    self.assertFalse(volatile.exists())
                 Path(command[-1]).write_bytes(elf(32, 40))
                 with self.assertRaisesRegex(RuntimeError, 'integrity'):
                     tool.prepare_bundle(Path(d))
