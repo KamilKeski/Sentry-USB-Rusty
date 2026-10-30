@@ -21,9 +21,29 @@ available. If repair must prepare it while the root card is read-only, the tempo
 cache lives in `/run` and disappears on reboot. Repair preparation failure stops
 before storage is disconnected; it does not fall back to a 32-bit tool.
 
+If a writable cache is damaged, preparation moves it to a `.bad-*` directory
+for inspection and rebuilds from checksum-verified packages. An interrupted
+download can be retried; abandoned `.prepare-*` trees are removed during the
+next locked preparation. Cache reuse checks the full file inventory, hashes,
+and that library symlinks stay inside the private tree. This detects accidental
+damage; it is not protection against someone with root access rewriting both
+the files and their local verification record.
+
+Only one manual or boot-time repair can run in the server at a time. A second
+request returns an already-in-progress message. When automatic repair cannot
+prepare its tool, it still retries on later boots; the matching push notification
+is limited to once per 24 hours while `/mutable` can retain the notice marker.
+A successful repair preflight or a healthy boot clears that notice limit.
+
+The uncommon reported architecture `armv8l` is currently unsupported by the
+selector. It stops before repair rather than assuming ARM64 execution support.
+The normal `armv6l`/`armv7l` paths retain native 32-bit tool selection.
+
 Force repair still requires its existing destructive confirmation or automatic
 force-repair preference. Selecting a compatible executable does not make force
 repair lossless, and a repair-tool failure alone does not prove SSD hardware failure.
+Legacy setup now attempts a normal mount for journal replay and stops with a
+Repair Storage message if mounting fails; it no longer clears the journal itself.
 
 ## Can't reach http://sentryusb.local
 

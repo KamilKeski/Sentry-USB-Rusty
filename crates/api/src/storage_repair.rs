@@ -45,6 +45,10 @@ const REPAIR_LOG_DIR: &str = "/mutable";
 const CMD_TIMEOUT: Duration = Duration::from_secs(300);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const REPAIR_TOOL_SELECTOR: &str = include_str!("../../../run/xfs-repair-tool.py");
+// Shared by HTTP and boot recovery, including discovery/mount retry/preflight.
+// Move the permit into the task so cancellation of the HTTP request cannot
+// release admission while a repair is still running.
+static REPAIR_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Selected once per repair, before stopping services. Every stage (including
 /// destructive escalation) uses this exact executable/loader combination.
@@ -64,12 +68,15 @@ impl RepairTool {
     }
 }
 
-async fn select_repair_tool() -> Result<RepairTool, String> {
-    let prepared = run_capture(CMD_TIMEOUT, "python3", &["-c", REPAIR_TOOL_SELECTOR]).await;
+async fn select_repair_tool(selector: &str) -> Result<RepairTool, String> {
+    let prepared = run_capture(CMD_TIMEOUT, "python3", &["-c", selector]).await;
     if !prepared.ok {
         return Err(prepared.output);
     }
-    let command: Vec<String> = serde_json::from_str(&prepared.output)
+    if !prepared.stderr.trim().is_empty() {
+        tracing::warn!("[storage-repair] tool preparation diagnostics: {}", prepared.stderr.trim());
+    }
+    let command: Vec<String> = serde_json::from_str(&prepared.stdout)
         .map_err(|e| format!("Invalid XFS tool selection: {e}"))?;
     if command.is_empty() || !command[0].starts_with('/') {
         return Err("XFS tool selector returned no absolute executable path".into());
@@ -85,6 +92,8 @@ struct CmdResult {
     ok: bool,
     code: i32,
     output: String,
+    stdout: String,
+    stderr: String,
 }
 
 /// Run a command capturing exit status + combined stdout/stderr, never
@@ -100,15 +109,21 @@ async fn run_capture(timeout: Duration, name: &str, args: &[&str]) -> CmdResult 
             ok: false,
             code: -1,
             output: format!("(timed out after {timeout:?})"),
+            stdout: String::new(),
+            stderr: String::new(),
         },
         Ok(Err(e)) => CmdResult {
             ok: false,
             code: -1,
             output: format!("(failed to spawn {name}: {e})"),
+            stdout: String::new(),
+            stderr: String::new(),
         },
         Ok(Ok(o)) => {
-            let mut s = String::from_utf8_lossy(&o.stdout).into_owned();
-            let err = String::from_utf8_lossy(&o.stderr);
+            let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&o.stderr).into_owned();
+            let mut s = stdout.clone();
+            let err = &stderr;
             if !err.trim().is_empty() {
                 if !s.is_empty() && !s.ends_with('\n') {
                     s.push('\n');
@@ -119,6 +134,8 @@ async fn run_capture(timeout: Duration, name: &str, args: &[&str]) -> CmdResult 
                 ok: o.status.success(),
                 code: o.status.code().unwrap_or(-1),
                 output: s.trim_end().to_string(),
+                stdout,
+                stderr,
             }
         }
     }
@@ -180,6 +197,29 @@ fn needs_log_replay(out: &str) -> bool {
 /// root). Written BEFORE the repair starts so a crash mid-repair can't
 /// reboot-loop; cleared only by a boot where /backingfiles is mounted.
 const AUTO_REPAIR_MARKER: &str = "/mutable/.storage_auto_repair_attempted";
+const PREFLIGHT_NOTICE_MARKER: &str = "/mutable/.storage_auto_repair_preflight_notice";
+
+fn unix_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+// Notification throttling is independent of repair eligibility. A Pi without
+// a cached tool should retry every boot, without sending a push every drive.
+fn claim_preflight_notice(path: &str, now: u64) -> bool {
+    let previous = std::fs::read_to_string(path).ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|value| value.get("ts").and_then(|ts| ts.as_u64()));
+    if previous.is_some_and(|last| now >= last && now - last < 24 * 60 * 60) {
+        return false;
+    }
+    if let Err(error) = std::fs::write(path, format!("{{\"ts\":{now}}}\n")) {
+        tracing::warn!("[storage-boot] could not persist preflight notice limit: {error}");
+    }
+    true
+}
 
 fn marker_exists(path: &str) -> bool {
     std::path::Path::new(path).exists()
@@ -343,6 +383,18 @@ async fn boot_check(hub: sentryusb_ws::Hub, marker: &str) {
     let force_allowed =
         crate::notification_center::bool_pref(&prefs, "storage_auto_force_repair", false);
 
+    if !auto_enabled {
+        tracing::info!("[storage-boot] auto repair skipped: storage_auto_repair disabled");
+        return;
+    }
+    let permit = match REPAIR_LOCK.try_lock() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::info!("[storage-boot] storage repair already active; skipping boot check");
+            return;
+        }
+    };
+
     let device = resolve_backing_device().await;
     let external = match &device {
         Some(d) => is_external(d).await,
@@ -369,6 +421,7 @@ async fn boot_check(hub: sentryusb_ws::Hub, marker: &str) {
         }
         BootAction::ClearMarker => {
             clear_marker(marker);
+            clear_marker(PREFLIGHT_NOTICE_MARKER);
         }
         BootAction::NotifyRepeatCorruption => {
             tracing::warn!(
@@ -390,7 +443,7 @@ async fn boot_check(hub: sentryusb_ws::Hub, marker: &str) {
             tracing::warn!(
                 "[storage-boot] /backingfiles corrupt — starting auto repair (force_allowed={force_allowed})"
             );
-            run_repair(hub, device, RepairMode::AutoBoot { force_allowed }).await;
+            run_repair(hub, device, RepairMode::AutoBoot { force_allowed }, permit).await;
         }
     }
 }
@@ -657,6 +710,12 @@ impl RepairLog {
 /// precondition) then spawns the repair, streaming progress over WS. Returns
 /// `{ "status": "started" }` on a valid request.
 pub async fn storage_repair(State(hub): State<sentryusb_ws::Hub>, body: String) -> (StatusCode, Json<serde_json::Value>) {
+    let permit = match REPAIR_LOCK.try_lock() {
+        Ok(permit) => permit,
+        Err(_) => return crate::json_error(
+            StatusCode::CONFLICT, "Storage repair is already in progress. Wait for it to finish.",
+        ),
+    };
     let req: RepairRequest = serde_json::from_str(&body).unwrap_or_default();
 
     let device = match resolve_backing_device().await {
@@ -697,6 +756,7 @@ pub async fn storage_repair(State(hub): State<sentryusb_ws::Hub>, body: String) 
             hub,
             device,
             RepairMode::Interactive { confirm_destructive: req.confirm_destructive },
+            permit,
         )
         .await;
     });
@@ -704,7 +764,10 @@ pub async fn storage_repair(State(hub): State<sentryusb_ws::Hub>, body: String) 
     (StatusCode::OK, Json(serde_json::json!({ "status": "started" })))
 }
 
-async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
+async fn run_repair(
+    hub: sentryusb_ws::Hub, device: String, mode: RepairMode,
+    _permit: tokio::sync::MutexGuard<'static, ()>,
+) {
     let mut log = RepairLog { hub: hub.clone(), buf: String::new() };
     let t = CMD_TIMEOUT;
     let (auto, force_allowed) = match mode {
@@ -720,7 +783,7 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
     // Kernel ABI matters, not the Rust server's build target or userspace
     // bitness: Pi OS armhf can run on an aarch64 kernel. Never silently fall
     // back to armhf if preparation of the required arm64 tool fails.
-    let tool = match select_repair_tool().await {
+    let tool = match select_repair_tool(REPAIR_TOOL_SELECTOR).await {
         Ok(tool) => tool,
         Err(error) => {
             log.line("preflight", &error);
@@ -729,7 +792,7 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
                 "status": "error", "device": device, "log_file": log_file,
                 "error": format!("Cannot prepare compatible XFS repair tool: {error}. Storage was not changed."),
             }));
-            if auto {
+            if auto && claim_preflight_notice(PREFLIGHT_NOTICE_MARKER, unix_seconds()) {
                 notify_storage_repair("Automatic storage repair could not start", &error).await;
             }
             return;
@@ -744,7 +807,7 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
             "status": "error", "device": device, "log_file": log_file,
             "error": "Selected XFS repair tool cannot run. Storage was not changed.",
         }));
-        if auto {
+        if auto && claim_preflight_notice(PREFLIGHT_NOTICE_MARKER, unix_seconds()) {
             notify_storage_repair("Automatic storage repair could not start", &version.output).await;
         }
         return;
@@ -754,6 +817,7 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
     if auto {
         write_marker(AUTO_REPAIR_MARKER);
     }
+    clear_marker(PREFLIGHT_NOTICE_MARKER);
 
     // ── 1. Quiesce — NEVER stop the `sentryusb` service (it's us). ──
     log.line("quiesce", "Stopping the archive loop and USB gadget (the web UI stays up)…");
@@ -918,6 +982,83 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preflight_notice_is_rate_limited_without_consuming_repair_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let notice = dir.path().join("notice");
+        let notice = notice.to_str().unwrap();
+        let attempt = dir.path().join("attempt");
+        assert!(claim_preflight_notice(notice, 100_000));
+        assert!(!claim_preflight_notice(notice, 100_000), "same-boot alert repeated");
+        assert!(!claim_preflight_notice(notice, 186_399), "alert repeated within 24 hours");
+        assert!(claim_preflight_notice(notice, 186_400));
+        assert!(!attempt.exists());
+        assert_eq!(decide_boot_action(true, true, true, false, attempt.exists()), BootAction::Repair);
+        clear_marker(notice);
+        assert!(claim_preflight_notice(notice, 186_401), "new incident should notify immediately");
+    }
+
+    #[test]
+    fn preflight_notice_recovers_from_bad_timestamp_or_clock_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let notice = dir.path().join("notice");
+        let notice = notice.to_str().unwrap();
+        std::fs::write(notice, "corrupt").unwrap();
+        assert!(claim_preflight_notice(notice, 100_000));
+        assert!(!claim_preflight_notice(notice, 100_001));
+        assert!(claim_preflight_notice(notice, 50_000), "future timestamp must not suppress alerts indefinitely");
+        assert!(!claim_preflight_notice(notice, 50_001));
+    }
+
+    #[tokio::test]
+    async fn overlapping_repair_request_is_rejected_before_device_probe() {
+        // Represents a boot/interactive repair already in preparation or I/O.
+        // Reject a new request immediately, even if device discovery would fail.
+        let _permit = REPAIR_LOCK.lock().await;
+        let request = storage_repair(State(sentryusb_ws::Hub::new()), "{}".into());
+        let (status, Json(body)) = tokio::time::timeout(Duration::from_secs(2), request)
+            .await.expect("busy repair request must not wait for device probes");
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body["error"].as_str().unwrap().contains("already"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selector_warning_does_not_reject_valid_stdout() {
+        let result = select_repair_tool(
+            "import sys; print('extractor warning', file=sys.stderr); print('[\"/usr/sbin/xfs_repair\"]')",
+        ).await;
+        let tool = result.unwrap_or_else(|error| panic!("successful selection rejected: {error}"));
+        assert_eq!(tool.0, vec!["/usr/sbin/xfs_repair"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selector_never_accepts_stderr_as_the_command() {
+        let result = select_repair_tool(
+            "import sys; print('[\"/usr/sbin/xfs_repair\"]', file=sys.stderr)",
+        ).await;
+        assert!(result.is_err(), "stderr must never supply the executable selection");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selector_failure_preserves_diagnostics_and_rejects_json() {
+        let result = select_repair_tool(
+            "import sys; print('[\"/usr/sbin/xfs_repair\"]'); print('download failed', file=sys.stderr); sys.exit(1)",
+        ).await;
+        assert!(matches!(result, Err(error) if error.contains("download failed")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn selector_rejects_empty_relative_or_polluted_stdout() {
+        for output in ["[]", "[\"relative/path\"]", "warning\\n[\"/usr/sbin/xfs_repair\"]"] {
+            let script = format!("print({})", serde_json::to_string(output).unwrap());
+            assert!(select_repair_tool(&script).await.is_err(), "accepted {output}");
+        }
+    }
 
     #[test]
     fn selected_tool_is_used_for_check_normal_retry_and_force() {

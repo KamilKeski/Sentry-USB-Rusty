@@ -374,6 +374,7 @@ jobs:
         run: |
           python3 test/xfs-repair-tool.test.py
           bash test/install-pi-safety.test.sh
+          bash test/legacy-storage-repair.test.sh
           bash test/sentryusb-pick-binary.test.sh
           bash test/ble-setup-recovery.test.sh
 

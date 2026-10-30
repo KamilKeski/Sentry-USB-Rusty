@@ -10,6 +10,7 @@ import os
 import json
 import subprocess
 import sys
+import time
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("repair_tool", Path(__file__).resolve().parents[1] / "run/xfs-repair-tool.py")
@@ -23,6 +24,17 @@ def elf(bits, machine):
     b[5] = 1
     b[18:20] = machine.to_bytes(2, "little")
     return bytes(b)
+
+def cached_fixture(root):
+    files = {}
+    for name in ('usr/sbin/xfs_repair', 'usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1'):
+        path = root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(elf(64, 183))
+        files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+    manifest = {'packages': tool.PACKAGES, 'files': files}
+    (root / 'verified.json').write_text(json.dumps(manifest))
+    return manifest
 
 class RepairToolTests(unittest.TestCase):
     def test_aarch64_kernel_rejects_armhf_even_with_32bit_userspace(self):
@@ -72,7 +84,7 @@ class RepairToolTests(unittest.TestCase):
             tool.verify_package(b"bad package", "0" * 64)
 
     @unittest.skipIf(os.name == 'nt', 'Linux cache locking')
-    def test_bundle_is_verified_cached_offline_and_tampering_rejected(self):
+    def test_bundle_is_verified_cached_offline_and_corruption_is_rebuilt(self):
         data = b'verified deb fixture'
         packages = [['pool/fixture.deb', hashlib.sha256(data).hexdigest()]]
         def run(args, **kwargs):
@@ -102,8 +114,134 @@ class RepairToolTests(unittest.TestCase):
                     self.assertEqual(json.loads(stdout.getvalue()), command)
                     self.assertFalse(volatile.exists())
                 Path(command[-1]).write_bytes(elf(32, 40))
-                with self.assertRaisesRegex(RuntimeError, 'integrity'):
-                    tool.prepare_bundle(Path(d))
+                self.assertFalse(tool.bundle_valid(Path(command[-1]).parents[2]))
+            # An invalid writable cache must not permanently block repair.
+            # Preserve the damaged tree for inspection, then rebuild only
+            # from freshly checksum-verified packages.
+            with patch.object(tool.urllib.request, 'urlopen', return_value=io.BytesIO(data)), patch.object(tool.subprocess, 'run', side_effect=run):
+                self.assertEqual(tool.prepare_bundle(Path(d)), command)
+            self.assertTrue(tool.bundle_valid(Path(command[-1]).parents[2]))
+            quarantined = list(Path(d).glob('.bad-*'))
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual((quarantined[0] / 'usr/sbin/xfs_repair').read_bytes(), elf(32, 40))
+
+    @unittest.skipIf(os.name == 'nt', 'Linux cache locking')
+    def test_corrupt_cache_with_failed_download_is_preserved_and_can_retry(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d)
+            version = hashlib.sha256(json.dumps(tool.PACKAGES).encode()).hexdigest()[:16]
+            root = cache / ('arm64-' + version)
+            root.mkdir()
+            (root / 'damaged').write_bytes(b'keep this evidence')
+            with patch.object(tool.urllib.request, 'urlopen', side_effect=RuntimeError('offline')):
+                with self.assertRaisesRegex(RuntimeError, 'offline'):
+                    tool.prepare_bundle(cache)
+            self.assertFalse(root.exists(), 'invalid tree must not occupy the active cache path')
+            quarantined = list(cache.glob('.bad-*'))
+            self.assertEqual(len(quarantined), 1)
+            self.assertEqual((quarantined[0] / 'damaged').read_bytes(), b'keep this evidence')
+            self.assertEqual(list(cache.glob('.prepare-*')), [])
+
+    def test_cache_inventory_rejects_missing_extra_or_malformed_records(self):
+        for case in ('empty', 'omitted', 'extra-library', 'list', 'wrong-top-level', 'escape'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as d:
+                root = Path(d) / 'bundle'
+                manifest = cached_fixture(root)
+                self.assertTrue(tool.bundle_valid(root))
+                if case == 'empty':
+                    manifest['files'] = {}
+                elif case == 'omitted':
+                    del manifest['files']['usr/sbin/xfs_repair']
+                elif case == 'extra-library':
+                    (root / 'usr/lib/aarch64-linux-gnu/libunexpected.so').write_bytes(b'extra')
+                elif case == 'list':
+                    manifest['files'] = []
+                elif case == 'wrong-top-level':
+                    manifest = []
+                elif case == 'escape':
+                    outside = Path(d) / 'outside'
+                    outside.write_bytes(b'outside')
+                    manifest['files']['../outside'] = hashlib.sha256(b'outside').hexdigest()
+                (root / 'verified.json').write_text(json.dumps(manifest))
+                self.assertFalse(tool.bundle_valid(root), f'accepted {case} inventory')
+
+    @unittest.skipIf(os.name == 'nt', 'Linux symlinks')
+    def test_cache_rejects_library_symlink_outside_private_tree(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d) / 'bundle'
+            manifest = cached_fixture(root)
+            outside = Path(d) / 'outside.so'
+            outside.write_bytes(b'outside library')
+            relative = 'usr/lib/aarch64-linux-gnu/liboutside.so'
+            (root / relative).symlink_to(outside)
+            manifest['files'][relative] = hashlib.sha256(outside.read_bytes()).hexdigest()
+            (root / 'verified.json').write_text(json.dumps(manifest))
+            self.assertFalse(tool.bundle_valid(root))
+
+    @unittest.skipIf(os.name == 'nt', 'Linux cache locking')
+    def test_next_preparation_removes_only_abandoned_staging_entries(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d)
+            version = hashlib.sha256(json.dumps(tool.PACKAGES).encode()).hexdigest()[:16]
+            root = cache / ('arm64-' + version)
+            cached_fixture(root)
+            stale = cache / '.prepare-interrupted/root'
+            stale.mkdir(parents=True)
+            (stale / 'partial').write_bytes(b'partial extraction')
+            preserved = cache / '.bad-previous'
+            preserved.mkdir()
+            (preserved / 'evidence').write_bytes(b'keep')
+            (cache / '.prepare-symlink').symlink_to(preserved, target_is_directory=True)
+            with patch.object(tool.urllib.request, 'urlopen', side_effect=AssertionError('network')):
+                self.assertEqual(tool.prepare_bundle(cache), tool.bundle_command(root))
+            self.assertEqual(list(cache.glob('.prepare-*')), [])
+            self.assertEqual((preserved / 'evidence').read_bytes(), b'keep')
+
+    @unittest.skipIf(os.name == 'nt', 'Linux process/lock inheritance')
+    def test_extractor_holds_lock_after_preparer_is_killed(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / 'cache'
+            ready, release = Path(d) / 'ready', Path(d) / 'release'
+            extractor = f'''import pathlib, time
+pathlib.Path({str(ready)!r}).touch()
+deadline = time.monotonic() + 10
+while not pathlib.Path({str(release)!r}).exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+'''
+            probe = f'''import importlib.util, pathlib, hashlib, io, subprocess, sys
+spec = importlib.util.spec_from_file_location('repair_tool', {str(Path(tool.__file__).resolve())!r})
+tool = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tool)
+tool.PACKAGES = [['fixture.deb', hashlib.sha256(b'fixture').hexdigest()]]
+tool.urllib.request.urlopen = lambda *a, **k: io.BytesIO(b'fixture')
+run = subprocess.run
+def extract(args, **kwargs):
+    return run([sys.executable, '-c', {extractor!r}], **kwargs)
+tool.subprocess.run = extract
+tool.prepare_bundle(pathlib.Path({str(cache)!r}))
+'''
+            parent = subprocess.Popen([sys.executable, '-B', '-c', probe],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                deadline = time.monotonic() + 5
+                while not ready.exists() and parent.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                self.assertTrue(ready.exists(), 'extractor did not start')
+                parent.kill()
+                parent.wait(timeout=5)
+                with (cache / 'prepare.lock').open('a') as lock:
+                    with self.assertRaises(BlockingIOError):
+                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                release.touch()
+                if parent.poll() is None:
+                    parent.kill()
+                parent.wait(timeout=5)
+                # Wait for the orphan to release its inherited lock before
+                # TemporaryDirectory removes the disposable staging tree.
+                unlock = f"import fcntl; f=open({str(cache / 'prepare.lock')!r}, 'a'); fcntl.flock(f, fcntl.LOCK_EX)"
+                subprocess.run([sys.executable, '-c', unlock], check=True, timeout=5)
 
     @unittest.skipIf(os.name == 'nt', 'Linux cache locking')
     def test_bad_download_never_extracts_or_publishes(self):

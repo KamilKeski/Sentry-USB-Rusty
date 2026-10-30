@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
+import uuid
 
 # Reviewed Debian trixie arm64 packages. Refresh versions and hashes together.
 PACKAGES = [
@@ -78,11 +79,25 @@ def bundle_command(root):
 
 def bundle_valid(root):
     try:
-        manifest = json.loads((root / 'verified.json').read_text())
-        if manifest['packages'] != PACKAGES:
+        if root.is_symlink() or (root / 'verified.json').is_symlink():
             return False
-        for name, digest in manifest['files'].items():
-            if hashlib.sha256((root / name).read_bytes()).hexdigest() != digest:
+        manifest = json.loads((root / 'verified.json').read_text())
+        if not isinstance(manifest, dict) or manifest.get('packages') != PACKAGES:
+            return False
+        files = manifest.get('files')
+        if not isinstance(files, dict) or not files:
+            return False
+        actual = {str(f.relative_to(root)): f for f in root.rglob('*')
+                  if (not f.is_dir() or f.is_symlink()) and f != root / 'verified.json'}
+        if set(files) != set(actual):
+            return False
+        private_root = root.resolve()
+        for name, path in actual.items():
+            if not path.is_file():
+                return False
+            # Libraries must stay inside the private tree, including symlinks.
+            path.resolve(strict=True).relative_to(private_root)
+            if hashlib.sha256(path.read_bytes()).hexdigest() != files[name]:
                 return False
         return (compatible('aarch64', header(root / 'usr/sbin/xfs_repair'))
                 and compatible('aarch64', header(Path(bundle_command(root)[0]))))
@@ -101,10 +116,21 @@ def prepare_bundle(cache):
         # Wait and reuse its result instead of failing the one-shot repair.
         # API, setup and upgrade callers all bound this process with a timeout.
         fcntl.flock(lock, fcntl.LOCK_EX)
+        # A killed preparer cannot run finally. Extractors inherit this lock,
+        # so no still-running child can be writing these trees during cleanup.
+        for stale in cache.glob('.prepare-*'):
+            if stale.is_symlink() or not stale.is_dir():
+                stale.unlink()
+            else:
+                shutil.rmtree(stale)
         if bundle_valid(root):
             return bundle_command(root)
-        if root.exists():
-            raise RuntimeError('Cached XFS tool failed integrity verification; refusing to use it')
+        if root.exists() or root.is_symlink():
+            # Preserve evidence without leaving a broken tree at the active
+            # cache path. A failed download can then be retried normally.
+            bad = cache / ('.bad-' + root.name + '-' + uuid.uuid4().hex)
+            root.rename(bad)
+            print(f'Quarantined invalid XFS repair cache: {bad}; rebuilding', file=sys.stderr)
         stage = Path(tempfile.mkdtemp(prefix='.prepare-', dir=cache))
         try:
             tree = stage / 'root'
@@ -116,7 +142,8 @@ def prepare_bundle(cache):
                 deb = stage / Path(filename).name
                 deb.write_bytes(data)
                 subprocess.run(['dpkg-deb', '-x', str(deb), str(tree)],
-                               check=True, timeout=30, stdout=subprocess.DEVNULL)
+                               check=True, timeout=30, stdout=subprocess.DEVNULL,
+                               pass_fds=(lock.fileno(),))
             files = {str(f.relative_to(tree)): hashlib.sha256(f.read_bytes()).hexdigest()
                      for f in tree.rglob('*') if f.is_file()}
             (tree / 'verified.json').write_text(json.dumps({'packages': PACKAGES, 'files': files}))
@@ -124,7 +151,8 @@ def prepare_bundle(cache):
                 raise RuntimeError('Prepared XFS tool has an unexpected executable architecture')
             # Validate loader and shared libraries before publishing the cache.
             subprocess.run(bundle_command(tree) + ['-V'], check=True, timeout=10,
-                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                           pass_fds=(lock.fileno(),))
             tree.rename(root)
         finally:
             shutil.rmtree(stage)
