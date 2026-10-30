@@ -44,6 +44,38 @@ const REPAIR_LOG_DIR: &str = "/mutable";
 /// 5 min matches the wizard's xfs_repair budget.
 const CMD_TIMEOUT: Duration = Duration::from_secs(300);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const REPAIR_TOOL_SELECTOR: &str = include_str!("../../../run/xfs-repair-tool.py");
+
+/// Selected once per repair, before stopping services. Every stage (including
+/// destructive escalation) uses this exact executable/loader combination.
+struct RepairTool(Vec<String>);
+
+impl RepairTool {
+    fn invocation(&self, args: &[&str]) -> (String, Vec<String>) {
+        let mut command_args = self.0[1..].to_vec();
+        command_args.extend(args.iter().map(|arg| (*arg).to_string()));
+        (self.0[0].clone(), command_args)
+    }
+
+    async fn run(&self, timeout: Duration, args: &[&str]) -> CmdResult {
+        let (program, arguments) = self.invocation(args);
+        let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+        run_capture(timeout, &program, &arguments).await
+    }
+}
+
+async fn select_repair_tool() -> Result<RepairTool, String> {
+    let prepared = run_capture(CMD_TIMEOUT, "python3", &["-c", REPAIR_TOOL_SELECTOR]).await;
+    if !prepared.ok {
+        return Err(prepared.output);
+    }
+    let command: Vec<String> = serde_json::from_str(&prepared.output)
+        .map_err(|e| format!("Invalid XFS tool selection: {e}"))?;
+    if command.is_empty() || !command[0].starts_with('/') {
+        return Err("XFS tool selector returned no absolute executable path".into());
+    }
+    Ok(RepairTool(command))
+}
 
 // ───────────────────────── command capture ─────────────────────────
 
@@ -355,7 +387,6 @@ async fn boot_check(hub: sentryusb_ws::Hub, marker: &str) {
                     return;
                 }
             }
-            write_marker(marker);
             tracing::warn!(
                 "[storage-boot] /backingfiles corrupt — starting auto repair (force_allowed={force_allowed})"
             );
@@ -686,6 +717,44 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
         format!("Repairing {device} (XFS backingfiles); auto={auto} force_allowed={force_allowed}"),
     );
 
+    // Kernel ABI matters, not the Rust server's build target or userspace
+    // bitness: Pi OS armhf can run on an aarch64 kernel. Never silently fall
+    // back to armhf if preparation of the required arm64 tool fails.
+    let tool = match select_repair_tool().await {
+        Ok(tool) => tool,
+        Err(error) => {
+            log.line("preflight", &error);
+            let log_file = persist_log(&log.buf);
+            hub.broadcast("storage_repair", &serde_json::json!({
+                "status": "error", "device": device, "log_file": log_file,
+                "error": format!("Cannot prepare compatible XFS repair tool: {error}. Storage was not changed."),
+            }));
+            if auto {
+                notify_storage_repair("Automatic storage repair could not start", &error).await;
+            }
+            return;
+        }
+    };
+    log.line("preflight", format!("Selected XFS repair command: {}", tool.0.join(" ")));
+    let version = tool.run(PROBE_TIMEOUT, &["-V"]).await;
+    log.cmd("preflight", "selected xfs_repair -V", &version);
+    if !version.ok {
+        let log_file = persist_log(&log.buf);
+        hub.broadcast("storage_repair", &serde_json::json!({
+            "status": "error", "device": device, "log_file": log_file,
+            "error": "Selected XFS repair tool cannot run. Storage was not changed.",
+        }));
+        if auto {
+            notify_storage_repair("Automatic storage repair could not start", &version.output).await;
+        }
+        return;
+    }
+    // Tool acquisition is not a repair attempt. An offline first boot must
+    // not suppress a later attempt once the compatible tool is available.
+    if auto {
+        write_marker(AUTO_REPAIR_MARKER);
+    }
+
     // ── 1. Quiesce — NEVER stop the `sentryusb` service (it's us). ──
     log.line("quiesce", "Stopping the archive loop and USB gadget (the web UI stays up)…");
     let _ = run_capture(t, "systemctl", &["stop", "sentryusb-archive"]).await;
@@ -713,12 +782,12 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
 
     // ── 3. Read-only diagnosis. ──
     log.line("dryrun", "Running read-only check (xfs_repair -n)…");
-    let dry = run_capture(t, "xfs_repair", &["-n", &device]).await;
+    let dry = tool.run(t, &["-n", &device]).await;
     log.cmd("dryrun", &format!("xfs_repair -n {device}"), &dry);
 
     // ── 4. Non-destructive repair, with a mount-to-replay-log retry. ──
     log.line("repair", "Attempting repair (xfs_repair)…");
-    let mut rep = run_capture(t, "xfs_repair", &[&device]).await;
+    let mut rep = tool.run(t, &[&device]).await;
     log.cmd("repair", &format!("xfs_repair {device}"), &rep);
 
     if !rep.ok && needs_log_replay(&rep.output) {
@@ -728,7 +797,7 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
         if m.ok {
             let u = run_capture(t, "umount", &[BACKINGFILES]).await;
             log.cmd("repair", &format!("umount {BACKINGFILES}"), &u);
-            rep = run_capture(t, "xfs_repair", &[&device]).await;
+            rep = tool.run(t, &[&device]).await;
             log.cmd("repair", &format!("xfs_repair {device} (after log replay)"), &rep);
         } else {
             log.line("repair", "Mount failed — the log cannot be replayed this way.");
@@ -764,7 +833,7 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
                     "Confirmed — clearing the XFS log (xfs_repair -L)…"
                 },
             );
-            rep = run_capture(t, "xfs_repair", &["-L", &device]).await;
+            rep = tool.run(t, &["-L", &device]).await;
             log.cmd("repair", &format!("xfs_repair -L {device}"), &rep);
             force_ran = true;
         }
@@ -778,7 +847,7 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
                 "status": "error",
                 "device": device,
                 "log_file": log_file,
-                "error": "xfs_repair could not repair the filesystem. Review the log — the drive itself may be failing (check the SSD's power, cable and enclosure).",
+                "error": "xfs_repair could not repair the filesystem. Review the log for filesystem, repair-tool, power, or connection errors; this alone does not establish SSD hardware failure.",
             }),
         );
         if auto {
@@ -849,6 +918,22 @@ async fn run_repair(hub: sentryusb_ws::Hub, device: String, mode: RepairMode) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_tool_is_used_for_check_normal_retry_and_force() {
+        let tool = RepairTool(vec!["/tools/loader".into(), "--library-path".into(),
+            "/tools/lib".into(), "/tools/xfs_repair".into()]);
+        for args in [vec!["-n", "/dev/sda2"], vec!["/dev/sda2"],
+                     vec!["/dev/sda2"], vec!["-L", "/dev/sda2"]] {
+            let (program, forwarded) = tool.invocation(&args);
+            assert_eq!(program, "/tools/loader");
+            assert_eq!(&forwarded[..3], &["--library-path", "/tools/lib", "/tools/xfs_repair"]);
+            assert_eq!(&forwarded[3..], &args);
+        }
+        let native = RepairTool(vec!["/usr/sbin/xfs_repair".into()]);
+        assert_eq!(native.invocation(&["-L", "/dev/sda2"]),
+            ("/usr/sbin/xfs_repair".into(), vec!["-L".into(), "/dev/sda2".into()]));
+    }
 
     #[test]
     fn parent_disk_strips_partition_suffix() {

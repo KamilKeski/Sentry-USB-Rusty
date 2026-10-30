@@ -2,6 +2,24 @@
 
 Most install problems fall into a few buckets. If your issue isn't here, ping **[Discord](https://discord.gg/9QZEzVwdnt)** — answers come fast and we'll add common ones to this page over time.
 
+## Storage repair on 32-bit and 64-bit installations
+
+Repair Storage selects its executable from the kernel architecture and the
+executable's ELF header, not the filesystem or the web server's architecture.
+A Pi running a 64-bit ARM kernel with 32-bit userspace uses a private ARM64 XFS
+tool and libraries. The read-only check, normal repair, log-replay retry, and
+confirmed force repair all use the same selected tool, recorded in the repair log.
+
+Setup and the installer prepare a checksum-verified tool cache on the root card
+for offline recovery. An existing installation without that cache needs internet
+access the first time it prepares the ARM64 tool. If the root card is read-only,
+the temporary cache lives in `/run` and disappears on reboot. Preparation failure
+stops before storage is disconnected; it does not fall back to a 32-bit tool.
+
+Force repair still requires its existing destructive confirmation or automatic
+force-repair preference. Selecting a compatible executable does not make force
+repair lossless, and a repair-tool failure alone does not prove SSD hardware failure.
+
 ## Can't reach http://sentryusb.local
 
 The Pi is up but its hostname isn't resolving on your network.

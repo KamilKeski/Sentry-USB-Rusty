@@ -201,6 +201,7 @@ pub async fn install_runtime_scripts(emitter: &crate::SetupEmitter) -> Result<bo
 
     let scripts: &[(&str, &str)] = &[
         ("remountfs_rw", REMOUNTFS_RW),
+        ("xfs-repair-tool.py", include_str!("../../../run/xfs-repair-tool.py")),
         ("mountoptsforimage", MOUNTOPTSFORIMAGE),
         ("mountimage", MOUNTIMAGE),
         ("make_snapshot.sh", MAKE_SNAPSHOT),
@@ -255,6 +256,13 @@ pub async fn install_runtime_scripts(emitter: &crate::SetupEmitter) -> Result<bo
         let _ = std::os::unix::fs::symlink("/root/bin/mountimage", "/sbin/mount.sentryusb");
     }
 
+    // Prepare on the root card while setup has it writable. Repair can then
+    // work offline even when the external backingfiles filesystem is down.
+    if let Err(error) = sentryusb_shell::run_with_timeout(std::time::Duration::from_secs(240), "python3", &[
+        "/root/bin/xfs-repair-tool.py", "--cache-persistent",
+    ]).await {
+        emitter.progress(&format!("XFS repair tool preparation deferred: {error}. Repair may need internet access."));
+    }
     emitter.progress("Runtime scripts installed.");
     Ok(true)
 }

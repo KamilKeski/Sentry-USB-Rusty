@@ -384,6 +384,8 @@ function get_common_scripts () {
   copy_script run/remountfs_rw /root/bin
   copy_script run/make_snapshot.sh /root/bin
   copy_script run/release_snapshot.sh /root/bin
+  copy_script run/xfs-repair-tool.py /root/bin
+  timeout 240 python3 /root/bin/xfs-repair-tool.py --cache-persistent || setup_progress "XFS repair tool preparation deferred; repair may need internet access"
   copy_script run/manage_free_space.sh /root/bin
   copy_script run/force_sync.sh /root/bin
   copy_script run/mountoptsforimage /root/bin
