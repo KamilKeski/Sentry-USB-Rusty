@@ -22,8 +22,10 @@ cache lives in `/run` and disappears on reboot. Repair preparation failure stops
 before storage is disconnected; it does not fall back to a 32-bit tool.
 
 If a writable cache is damaged, preparation moves it to a `.bad-*` directory
-for inspection and rebuilds from checksum-verified packages. An interrupted
-download can be retried; abandoned `.prepare-*` trees are removed during the
+for inspection and rebuilds from checksum-verified packages. Writable preparation
+keeps only the newest quarantined copy and removes older copies under the lock.
+If cleanup fails, it logs a warning without blocking an otherwise valid tool.
+Interrupted downloads can be retried; abandoned `.prepare-*` trees are removed during the
 next locked preparation. Cache reuse checks the full file inventory, hashes,
 and that library symlinks stay inside the private tree. This detects accidental
 damage; it is not protection against someone with root access rewriting both

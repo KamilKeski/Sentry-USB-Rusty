@@ -142,6 +142,71 @@ class RepairToolTests(unittest.TestCase):
             self.assertEqual((quarantined[0] / 'damaged').read_bytes(), b'keep this evidence')
             self.assertEqual(list(cache.glob('.prepare-*')), [])
 
+    @unittest.skipIf(os.name == 'nt', 'Linux cache locking')
+    def test_new_quarantine_replaces_older_copies_even_when_rebuild_fails(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d)
+            old = cache / '.bad-previous'
+            old.mkdir()
+            (old / 'evidence').write_bytes(b'older damage')
+            version = hashlib.sha256(json.dumps(tool.PACKAGES).encode()).hexdigest()[:16]
+            root = cache / ('arm64-' + version)
+            root.mkdir()
+            (root / 'evidence').write_bytes(b'latest damage')
+            # A rename keeps the directory's old mtime. Retention must keep
+            # the newly quarantined tree, not choose by its original mtime.
+            os.utime(root, (1, 1))
+            with patch.object(tool.urllib.request, 'urlopen', side_effect=RuntimeError('offline')):
+                with self.assertRaisesRegex(RuntimeError, 'offline'):
+                    tool.prepare_bundle(cache)
+            bad = list(cache.glob('.bad-*'))
+            self.assertEqual(len(bad), 1)
+            self.assertEqual((bad[0] / 'evidence').read_bytes(), b'latest damage')
+            self.assertFalse(old.exists())
+            self.assertFalse(root.exists())
+
+    @unittest.skipIf(os.name == 'nt', 'Linux cache locking and symlinks')
+    def test_writable_cache_reuse_prunes_old_quarantine_without_following_symlinks(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / 'cache'
+            version = hashlib.sha256(json.dumps(tool.PACKAGES).encode()).hexdigest()[:16]
+            root = cache / ('arm64-' + version)
+            cached_fixture(root)
+            outside = Path(d) / 'preserved'
+            outside.mkdir()
+            (outside / 'evidence').write_bytes(b'not cache data')
+            old = cache / '.bad-old-link'
+            old.symlink_to(outside, target_is_directory=True)
+            time.sleep(0.01)
+            newest = cache / '.bad-newest'
+            newest.mkdir()
+            (newest / 'evidence').write_bytes(b'latest quarantine')
+            self.assertGreater(newest.stat().st_ctime_ns, old.lstat().st_ctime_ns)
+            with patch.object(tool, 'PERSISTENT', cache), patch.object(tool, 'VOLATILE', Path(d) / 'unused'), \
+                 patch.object(tool.platform, 'machine', return_value='aarch64'), \
+                 patch.object(tool.shutil, 'which', return_value=None), \
+                 patch.object(tool.urllib.request, 'urlopen', side_effect=AssertionError('network')), \
+                 patch.object(tool.sys, 'stdout', new_callable=io.StringIO) as stdout:
+                tool.main()
+                self.assertEqual(json.loads(stdout.getvalue()), tool.bundle_command(root))
+            self.assertEqual(list(cache.glob('.bad-*')), [newest])
+            self.assertEqual((outside / 'evidence').read_bytes(), b'not cache data')
+            self.assertTrue(tool.bundle_valid(root))
+
+    @unittest.skipIf(os.name == 'nt', 'Linux cache locking')
+    def test_quarantine_cleanup_failure_does_not_block_a_valid_tool(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d)
+            version = hashlib.sha256(json.dumps(tool.PACKAGES).encode()).hexdigest()[:16]
+            root = cache / ('arm64-' + version)
+            cached_fixture(root)
+            (cache / '.bad-old').mkdir()
+            (cache / '.bad-new').mkdir()
+            with patch.object(tool.shutil, 'rmtree', side_effect=PermissionError('read-only entry')), \
+                 patch.object(tool.urllib.request, 'urlopen', side_effect=AssertionError('network')):
+                self.assertEqual(tool.prepare_bundle(cache), tool.bundle_command(root))
+            self.assertTrue(tool.bundle_valid(root))
+
     def test_cache_inventory_rejects_missing_extra_or_malformed_records(self):
         for case in ('empty', 'omitted', 'extra-library', 'list', 'wrong-top-level', 'escape'):
             with self.subTest(case=case), tempfile.TemporaryDirectory() as d:

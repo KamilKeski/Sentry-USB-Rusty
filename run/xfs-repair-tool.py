@@ -105,6 +105,27 @@ def bundle_valid(root):
         return False
 
 
+def prune_quarantines(cache, keep=None):
+    """Keep one damaged copy; caller must hold the preparation lock."""
+    copies = list(cache.glob('.bad-*'))
+    if not copies:
+        return
+    try:
+        # Renaming a damaged tree retains its old mtime. A newly quarantined
+        # copy is passed explicitly; older copies use inode-change time.
+        newest = keep or max(copies, key=lambda path: (path.lstat().st_ctime_ns, path.name))
+        for old in copies:
+            if old == newest:
+                continue
+            if old.is_symlink() or not old.is_dir():
+                old.unlink()
+            else:
+                shutil.rmtree(old)
+    except OSError as error:
+        # Housekeeping must not make an otherwise usable repair tool fail.
+        print(f'Could not prune older XFS repair quarantines: {error}', file=sys.stderr)
+
+
 def prepare_bundle(cache):
     import fcntl
     cache.mkdir(parents=True, exist_ok=True)
@@ -124,13 +145,17 @@ def prepare_bundle(cache):
             else:
                 shutil.rmtree(stale)
         if bundle_valid(root):
+            prune_quarantines(cache)
             return bundle_command(root)
+        newest_bad = None
         if root.exists() or root.is_symlink():
             # Preserve evidence without leaving a broken tree at the active
             # cache path. A failed download can then be retried normally.
             bad = cache / ('.bad-' + root.name + '-' + uuid.uuid4().hex)
             root.rename(bad)
+            newest_bad = bad
             print(f'Quarantined invalid XFS repair cache: {bad}; rebuilding', file=sys.stderr)
+        prune_quarantines(cache, newest_bad)
         stage = Path(tempfile.mkdtemp(prefix='.prepare-', dir=cache))
         try:
             tree = stage / 'root'
@@ -177,7 +202,10 @@ def main():
         version = hashlib.sha256(json.dumps(PACKAGES).encode()).hexdigest()[:16]
         root = PERSISTENT / ('arm64-' + version)
         if bundle_valid(root):
-            print(json.dumps(bundle_command(root)))
+            # Writable reuse also performs bounded quarantine housekeeping.
+            # Read-only recovery must keep working without opening a lock.
+            command = prepare_bundle(PERSISTENT) if cache == PERSISTENT else bundle_command(root)
+            print(json.dumps(command))
             return
     if '--cache-persistent' in sys.argv:
         cache = PERSISTENT

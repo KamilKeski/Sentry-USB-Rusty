@@ -355,6 +355,16 @@ async fn notify_storage_repair(message: &str, summary: &str) {
     }
 }
 
+async fn finish_boot_notice(
+    permit: tokio::sync::MutexGuard<'_, ()>,
+    notice: impl std::future::Future<Output = ()>,
+) {
+    // No repair is running in this branch. Let the owner act on the notice
+    // immediately, even if delivery to another provider is still pending.
+    drop(permit);
+    notice.await;
+}
+
 // ───────────────────────── boot-time auto repair ─────────────────────────
 
 /// Settle delay before the boot check. Long enough for fstab mounts and
@@ -427,7 +437,10 @@ async fn boot_check(hub: sentryusb_ws::Hub, marker: &str) {
             tracing::warn!(
                 "[storage-boot] corrupt again after a previous auto repair — not retrying (marker {marker})"
             );
-            notify_storage_repair(MSG_REPEAT_CORRUPTION, "Drive corruption returned. Check power and cables, then run Repair Storage manually.").await;
+            finish_boot_notice(permit, notify_storage_repair(
+                MSG_REPEAT_CORRUPTION,
+                "Drive corruption returned. Check power and cables, then run Repair Storage manually.",
+            )).await;
         }
         BootAction::Repair => {
             let device = device.expect("BootAction::Repair implies device_found");
@@ -982,6 +995,24 @@ async fn run_repair(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn repeat_corruption_notice_does_not_hold_repair_admission() {
+        let gate = tokio::sync::Mutex::new(());
+        let permit = gate.lock().await;
+        let (started, receiving) = tokio::sync::oneshot::channel();
+        let (finish, finished) = tokio::sync::oneshot::channel();
+        let notice = async {
+            started.send(()).unwrap();
+            finished.await.unwrap();
+        };
+        let manual_repair = async {
+            receiving.await.unwrap();
+            assert!(gate.try_lock().is_ok(), "manual repair blocked while notification is in flight");
+            finish.send(()).unwrap();
+        };
+        tokio::join!(finish_boot_notice(permit, notice), manual_repair);
+    }
 
     #[test]
     fn preflight_notice_is_rate_limited_without_consuming_repair_attempt() {
