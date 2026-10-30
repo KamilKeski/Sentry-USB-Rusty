@@ -10,11 +10,16 @@ A Pi running a 64-bit ARM kernel with 32-bit userspace uses a private ARM64 XFS
 tool and libraries. The read-only check, normal repair, log-replay retry, and
 confirmed force repair all use the same selected tool, recorded in the repair log.
 
-Setup and the installer prepare a checksum-verified tool cache on the root card
-for offline recovery. An existing installation without that cache needs internet
-access the first time it prepares the ARM64 tool. If the root card is read-only,
-the temporary cache lives in `/run` and disappears on reboot. Preparation failure
-stops before storage is disconnected; it does not fall back to a 32-bit tool.
+Setup, the installer, and the first startup migration after an update prepare a
+checksum-verified tool cache on the root card for offline recovery. Existing
+installations do not need to rerun setup or toggle Auto Repair to receive it.
+Compatible native tools and already-verified caches are reused without downloading.
+Update preparation runs in the background and only prepares the tool; it never
+starts a repair. A failed download is logged without failing the update. Setup or
+an actual repair can retry, but offline recovery is not ready until the tool is
+available. If repair must prepare it while the root card is read-only, the temporary
+cache lives in `/run` and disappears on reboot. Repair preparation failure stops
+before storage is disconnected; it does not fall back to a 32-bit tool.
 
 Force repair still requires its existing destructive confirmation or automatic
 force-repair preference. Selecting a compatible executable does not make force

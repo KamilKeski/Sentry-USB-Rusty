@@ -97,10 +97,10 @@ def prepare_bundle(cache):
     version = hashlib.sha256(json.dumps(PACKAGES).encode()).hexdigest()[:16]
     root = cache / ('arm64-' + version)
     with open(cache / 'prepare.lock', 'a') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise RuntimeError('XFS tool preparation already running; try again shortly')
+        # An upgrade can be preparing this cache when boot auto-repair starts.
+        # Wait and reuse its result instead of failing the one-shot repair.
+        # API, setup and upgrade callers all bound this process with a timeout.
+        fcntl.flock(lock, fcntl.LOCK_EX)
         if bundle_valid(root):
             return bundle_command(root)
         if root.exists():

@@ -8,6 +8,8 @@ import hashlib
 import io
 import os
 import json
+import subprocess
+import sys
 from unittest.mock import patch
 
 spec = importlib.util.spec_from_file_location("repair_tool", Path(__file__).resolve().parents[1] / "run/xfs-repair-tool.py")
@@ -111,6 +113,46 @@ class RepairToolTests(unittest.TestCase):
                     tool.prepare_bundle(Path(d))
                 run.assert_not_called()
                 self.assertEqual([f.name for f in Path(d).iterdir()], ['prepare.lock'])
+
+    @unittest.skipIf(os.name == 'nt', 'Linux cache locking')
+    def test_repair_waits_for_upgrade_preparation_and_reuses_its_cache(self):
+        import fcntl
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d)
+            version = hashlib.sha256(json.dumps(tool.PACKAGES).encode()).hexdigest()[:16]
+            root = cache / ('arm64-' + version)
+            files = {}
+            for name in ('usr/sbin/xfs_repair', 'usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1'):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(elf(64, 183))
+                files[name] = hashlib.sha256(path.read_bytes()).hexdigest()
+            (root / 'verified.json').write_text(json.dumps({'packages': tool.PACKAGES, 'files': files}))
+            self.assertTrue(tool.bundle_valid(root))
+            probe = f'''import importlib.util, pathlib, json
+spec = importlib.util.spec_from_file_location('repair_tool', {str(Path(tool.__file__).resolve())!r})
+tool = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(tool)
+print('ready', flush=True)
+print(json.dumps(tool.prepare_bundle(pathlib.Path({d!r}))), flush=True)
+'''
+            with (cache / 'prepare.lock').open('a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                child = subprocess.Popen([sys.executable, '-B', '-c', probe],
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                try:
+                    self.assertEqual(child.stdout.readline().strip(), 'ready')
+                    with self.assertRaises(subprocess.TimeoutExpired):
+                        child.communicate(timeout=0.2)
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    output, error = child.communicate(timeout=5)
+                    self.assertEqual(child.returncode, 0, error)
+                    self.assertEqual(json.loads(output), tool.bundle_command(root))
+                finally:
+                    fcntl.flock(lock, fcntl.LOCK_UN)
+                    if child.poll() is None:
+                        child.kill()
+                    child.communicate()
 
 if __name__ == "__main__":
     unittest.main()
