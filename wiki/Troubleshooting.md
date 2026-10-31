@@ -108,7 +108,7 @@ The Bluetooth keep-awake holds your Tesla awake by talking to the car over BLE. 
 **Try:**
 
 1.  **Logs → Bluetooth** — shows which adapter the daemon picked, connection state, sample-DB counts, and the recent sampler journal lines.
-2.  Click **Download Bluetooth Bundle** on that tab to grab a single text report (full journal, LE params, hciconfig, rfkill, pairing state, dmesg, and the per-minute history) for sharing on Discord — saves a lot of back-and-forth.
+2.  Click **Download bundle** on that tab to grab a single text report (full journal, LE params, hciconfig, rfkill, pairing state, dmesg, and the per-minute history) for sharing on Discord — saves a lot of back-and-forth.
 3.  Re-pair from **Settings → Car & Network → "BLE Pairing"** card: confirm the VIN, click **Re-pair**, stay near the car, and **tap your key card on the center console** when prompted. The pair handler power-cycles the adapter and verifies the link before declaring success.
 4.  Reduce nearby BLE keys before re-pairing — Tesla allows only a few active BLE keys, and phones, watches, and BLE commanders can use them all up and block the Pi from pairing.
 

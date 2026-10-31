@@ -48,4 +48,4 @@ The Pi has a built-in Bluetooth radio, but for the most reliable telemetry we re
 
 ## Troubleshooting
 
-If pairing fails, the connection drops, or telemetry stops flowing, the **Logs → Bluetooth** tab has a live diagnostic dump and a **Download Bluetooth Bundle** button that grabs everything for sharing on Discord. Full steps: [Troubleshooting → BLE Keep Awake stops working / can't pair](Troubleshooting#ble-keep-awake-stops-working--cant-pair).
+If pairing fails, the connection drops, or telemetry stops flowing, the **Logs → Bluetooth** tab has a live diagnostic dump and a **Download bundle** button that grabs everything for sharing on Discord. Full steps: [Troubleshooting → BLE Keep Awake stops working / can't pair](Troubleshooting#ble-keep-awake-stops-working--cant-pair).

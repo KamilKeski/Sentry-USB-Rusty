@@ -102,11 +102,15 @@ device count.
 
 ### 5. Sentry Cloud (sync feature, opt-in)
 
-- **Endpoint:** Various `https://api.sentry-six.com/cloud/...` routes.
-- **Sent:** Your Sentry Cloud account credentials when signing in, followed by
-  encrypted drive-history and telemetry data you choose to sync. Sentry Cloud
-  does not upload dashcam video.
-- **Identifier:** Your Sentry Cloud account.
+- **Endpoint:** Various `https://sentryusb.com/api/pi/...` routes.
+- **Sent:** When you pair, the 6-digit code shown in your browser, the Pi's
+  public keys, and device details (hostname, board model, kernel version,
+  Sentry USB version, and the last 4 hex digits of a network MAC address).
+  After pairing, the drive-history and telemetry data you choose to sync,
+  encrypted on the Pi before upload. Your Sentry Cloud password is never
+  entered on or sent from the Pi. Sentry Cloud does not upload dashcam video.
+- **Identifier:** A per-device token issued at pairing and linked to your
+  Sentry Cloud account.
 - **Purpose:** Cloud sync requires it — the feature can't function
   otherwise.
 - **Legal basis:** Contractual necessity (Art. 6(1)(b)) — you signed
