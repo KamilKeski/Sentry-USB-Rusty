@@ -146,10 +146,11 @@ device count.
   destinations, network names, usernames, passwords, tokens, a hardware
   fingerprint, Pi login credential, or knowledge for another product.
 - **AI processing:** Relevant conversation content is processed by
-  Ollama Cloud to generate a response. Ollama states that Cloud prompts
-  and responses are processed transiently, are not retained beyond the
-  request, and are not used to train models. Processing may occur outside
-  Canada, including in the United States. The app identifies this as an
+  Anthropic (the Claude API) to generate a response. Anthropic states that
+  API inputs and outputs are not used to train its models and are deleted
+  from its systems within 30 days, unless longer retention is needed to
+  enforce its Usage Policy or is required by law. Processing may occur
+  outside Canada, including in the United States. The app identifies this as an
   online AI service; the model is not running solely on your Pi.
 - **Server logging:** A redacted transcript of messages and responses,
   timestamps, product/version context, action decisions, and limited
@@ -207,8 +208,8 @@ upload token; it is not standing permission for future files. You may deny
 the request and continue chatting.
 
 The approved report leaves your Pi, is uploaded to the Sentry Six backend,
-and relevant content may be processed transiently by Ollama Cloud and
-reviewed by authorized maintainers. The backend accepts only the expected
+and relevant content may be processed by Anthropic and reviewed by
+authorized maintainers. The backend accepts only the expected
 diagnostics request, plain UTF-8 text with control characters removed, and a
 maximum of 2 MiB. The file is deleted automatically after seven days. Review
 the disclosed categories before approving, and do not approve an upload if
