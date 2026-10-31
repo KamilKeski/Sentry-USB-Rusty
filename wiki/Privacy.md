@@ -102,11 +102,15 @@ device count.
 
 ### 5. Sentry Cloud (sync feature, opt-in)
 
-- **Endpoint:** Various `https://api.sentry-six.com/cloud/...` routes.
-- **Sent:** Your Sentry Cloud account credentials when signing in, followed by
-  encrypted drive-history and telemetry data you choose to sync. Sentry Cloud
-  does not upload dashcam video.
-- **Identifier:** Your Sentry Cloud account.
+- **Endpoint:** Various `https://sentryusb.com/api/pi/...` routes.
+- **Sent:** When you pair, the 6-digit code shown in your browser, the Pi's
+  public keys, and device details (hostname, board model, kernel version,
+  Sentry USB version, and the last 4 hex digits of a network MAC address).
+  After pairing, the drive-history and telemetry data you choose to sync,
+  encrypted on the Pi before upload. Your Sentry Cloud password is never
+  entered on or sent from the Pi. Sentry Cloud does not upload dashcam video.
+- **Identifier:** A per-device token issued at pairing and linked to your
+  Sentry Cloud account.
 - **Purpose:** Cloud sync requires it — the feature can't function
   otherwise.
 - **Legal basis:** Contractual necessity (Art. 6(1)(b)) — you signed
@@ -146,10 +150,11 @@ device count.
   destinations, network names, usernames, passwords, tokens, a hardware
   fingerprint, Pi login credential, or knowledge for another product.
 - **AI processing:** Relevant conversation content is processed by
-  Ollama Cloud to generate a response. Ollama states that Cloud prompts
-  and responses are processed transiently, are not retained beyond the
-  request, and are not used to train models. Processing may occur outside
-  Canada, including in the United States. The app identifies this as an
+  Anthropic (the Claude API) to generate a response. Anthropic states that
+  API inputs and outputs are not used to train its models and are deleted
+  from its systems within 30 days, unless longer retention is needed to
+  enforce its Usage Policy or is required by law. Processing may occur
+  outside Canada, including in the United States. The app identifies this as an
   online AI service; the model is not running solely on your Pi.
 - **Server logging:** A redacted transcript of messages and responses,
   timestamps, product/version context, action decisions, and limited
@@ -207,8 +212,8 @@ upload token; it is not standing permission for future files. You may deny
 the request and continue chatting.
 
 The approved report leaves your Pi, is uploaded to the Sentry Six backend,
-and relevant content may be processed transiently by Ollama Cloud and
-reviewed by authorized maintainers. The backend accepts only the expected
+and relevant content may be processed by Anthropic and reviewed by
+authorized maintainers. The backend accepts only the expected
 diagnostics request, plain UTF-8 text with control characters removed, and a
 maximum of 2 MiB. The file is deleted automatically after seven days. Review
 the disclosed categories before approving, and do not approve an upload if

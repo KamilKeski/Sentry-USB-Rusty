@@ -368,11 +368,16 @@ jobs:
           bash test/archiveloop-gadget-cycle-min.test.sh
           bash test/archiveloop-exfat-reclaim.test.sh
           bash test/archiveloop-camdisk-supervisor.test.sh
+          bash -n run/release_snapshot.sh
+          bash -n run/make_snapshot.sh
+          bash test/release-snapshot.test.sh
       - name: Run tests
         run: cargo test --workspace --locked
       - name: Run installer safety regressions
         run: |
+          python3 test/xfs-repair-tool.test.py
           bash test/install-pi-safety.test.sh
+          bash test/legacy-storage-repair.test.sh
           bash test/sentryusb-pick-binary.test.sh
           bash test/ble-setup-recovery.test.sh
 

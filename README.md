@@ -128,7 +128,7 @@ By default, Sentry USB sends **no device identifier** to our servers. Here's eve
 |---|---|---|
 | Device statistics (when enabled) | Running version; after startup, enabling reporting, and daily. Server keeps first/last report times. | Stable hashed device ID; no raw serial or boot ID |
 | Wraps / lock chime submissions | The file + your IP for rate-limiting and abuse handling | No device or hardware fingerprint; the IP may be retained with the submission |
-| Sentry Cloud (if signed in) | Your account + synced files | Account credentials |
+| Sentry Cloud (if paired) | At pairing: the code you enter, the Pi's public keys, hostname, board model, kernel and Sentry USB versions, and the last 4 digits of a MAC address. Then the drive and telemetry data you sync, encrypted on the Pi | A per-device token linked to your Sentry Cloud account; your account password never leaves your browser |
 | iOS push pairing (if enabled) | Random pairing ID | Not tied to hardware |
 | AI Support & Help (if used) | Chat messages, product/software version, and the Pi connection's public IP for abuse prevention; diagnostics only after a separate one-time approval | Random conversation ID and access token; no hardware fingerprint |
 
@@ -145,7 +145,7 @@ New installations preselect **Yes, count me** on the Privacy step. Reporting beg
 
 ## Build from source
 
-Prerequisites: Rust stable, Node 20+, and `cross` (`cargo install cross`).
+Prerequisites: Rust stable (1.85+), Node 20.19+ (or 22.12+), and `cross` (`cargo install cross`).
 
 ```bash
 # Web UI
@@ -168,7 +168,7 @@ See [BUILD.md](BUILD.md) for details.
 ./build-image.sh --32bit         # 32-bit image (armhf — Pi 3A+ with 32-bit Pi OS)
 ```
 
-The build-image script is for developers and CI; end users should use the curl-one-liner install above.
+Prebuilt images aren't offered right now, and this script isn't maintained or tested until image builds return. End users should use the curl one-liner install above.
 
 ---
 
